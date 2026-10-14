@@ -1,0 +1,22 @@
+{
+    "name": "CodePilot API",
+    "build": {
+        "dockerfile": "Dockerfile",
+        "context": ".."
+    },
+    "customizations": {
+        "vscode": {
+            "settings": {
+                "python.defaultInterpreterPath": "/usr/local/bin/python",
+                "python.formatting.provider": "black"
+            },
+            "extensions": [
+                "ms-python.python",
+                "ms-python.black-formatter",
+                "tamasfe.even-better-toml"
+            ]
+        }
+    },
+    "forwardPorts": [8000],
+    "postCreateCommand": "pip install -r requirements.txt"
+}
