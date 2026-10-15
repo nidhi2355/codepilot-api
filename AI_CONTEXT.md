@@ -17,10 +17,14 @@ CodePilot is an Agentic AI Software Engineer designed to autonomously understand
 
 ## Completed Steps
 - [x] Defined initial project requirements and phase plan.
-- [x] Initialized modular FastAPI application structure (`main.py`, `routes`, `services`).
-- [x] Created `/` (home) and `/health` endpoints with standard error handling.
-- [x] Configured `.devcontainer/Dockerfile` and `devcontainer.json` for the Podman/DevPod workflow.
+- [x] Initialized modular FastAPI application structure.
+- [x] Created `/` (home) and `/health` endpoints.
+- [x] Configured DevPod/Podman development environment.
+- [x] Set up async SQLAlchemy with SQLite for local development.
+- [x] Created database models and Pydantic schemas for Repositories.
+- [x] Implemented `POST /repositories` endpoint.
+- [x] Implemented `GitPython` background task for asynchronous repository cloning.
 
 ## Current Status & Next Action
-* **Status**: Base API is containerized, running, and pushed to GitHub.
-* **Next Step**: Implement the GitHub repository ingestion endpoint (e.g., `/repositories`).
+* **Status**: The API accepts GitHub URLs, saves them, and clones the files to `data/repos` asynchronously without blocking the user request.
+* **Next Step**: Implement an endpoint (`GET /repositories/{id}`) to check the repository status, and begin Phase 3 (Tree-sitter file parsing and symbol extraction).

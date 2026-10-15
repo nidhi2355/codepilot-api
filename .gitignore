@@ -1,0 +1,9 @@
+# Local database
+codepilot.db
+
+# Cloned repositories
+data/
+
+# Python cache
+__pycache__/
+*.py[cod]
