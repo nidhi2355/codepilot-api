@@ -22,9 +22,9 @@ CodePilot is an Agentic AI Software Engineer designed to autonomously understand
 - [x] Configured DevPod/Podman development environment.
 - [x] Set up async SQLAlchemy with SQLite for local development.
 - [x] Created database models and Pydantic schemas for Repositories.
-- [x] Implemented `POST /repositories` endpoint.
-- [x] Implemented `GitPython` background task for asynchronous repository cloning.
+- [x] Implemented `POST /repositories` endpoint with asynchronous `GitPython` cloning.
+- [x] Implemented `GET /repositories/{id}` and `GET /repositories` for status polling.
 
 ## Current Status & Next Action
-* **Status**: The API accepts GitHub URLs, saves them, and clones the files to `data/repos` asynchronously without blocking the user request.
-* **Next Step**: Implement an endpoint (`GET /repositories/{id}`) to check the repository status, and begin Phase 3 (Tree-sitter file parsing and symbol extraction).
+* **Status**: Phase 2 (Repository Ingestion) API routes are complete. The system can ingest, clone, and report the status of repositories.
+* **Next Step**: Begin Phase 3 (Code Parsing) by integrating Tree-sitter to parse the cloned files and extract symbols like classes and functions.
