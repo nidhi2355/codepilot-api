@@ -15,6 +15,7 @@ os.makedirs(REPOS_DIR, exist_ok=True)
 class GitService:
     @staticmethod
     async def clone_repository_task(repo_id: int, github_url: str):
+        print(f"DEBUG: Background task executing for repo ID {repo_id}")
         """Background task to clone the repo and update its status."""
         repo_name = github_url.rstrip("/").split("/")[-1]
         target_path = os.path.join(REPOS_DIR, repo_name)

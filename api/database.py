@@ -9,7 +9,13 @@ engine = create_async_engine(
     connect_args={"check_same_thread": False} # Needed only for SQLite
 )
 
-SessionLocal = async_sessionmaker(autocommit=False, autoflush=False, bind=engine, class_=AsyncSession)
+SessionLocal = async_sessionmaker(
+    autocommit=False, 
+    autoflush=False, 
+    bind=engine, 
+    class_=AsyncSession, 
+    expire_on_commit=False  # Added this parameter
+)
 
 Base = declarative_base()
 

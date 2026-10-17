@@ -3,6 +3,10 @@ from contextlib import asynccontextmanager
 from api.database import engine, Base
 from api.routes.base import router as base_router
 from api.routes.repositories import router as repo_router
+import logging
+
+# Force Python to show INFO level logs in the terminal
+logging.basicConfig(level=logging.INFO)
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
