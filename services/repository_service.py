@@ -35,3 +35,15 @@ class RepositoryService:
             await db.rollback()
             logger.error(f"Error creating repository: {str(e)}")
             raise e
+
+    @staticmethod
+    async def get_repository(db: AsyncSession, repo_id: int) -> Repository | None:
+        """Fetches a single repository by its database ID."""
+        result = await db.execute(select(Repository).filter(Repository.id == repo_id))
+        return result.scalars().first()
+
+    @staticmethod
+    async def get_repositories(db: AsyncSession) -> list[Repository]:
+        """Fetches all repositories."""
+        result = await db.execute(select(Repository))
+        return result.scalars().all()
