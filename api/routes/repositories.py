@@ -6,6 +6,8 @@ from services.repository_service import RepositoryService
 from services.git_service import GitService
 from services.parser_service import ParserService
 from services.embedding_service import EmbeddingService
+from api.schemas.search import SearchQuery
+from services.search_service import SearchService
 
 router = APIRouter(prefix="/repositories", tags=["Repositories"])
 
@@ -89,3 +91,25 @@ async def embed_repository(
     background_tasks.add_task(EmbeddingService.embed_repository_task, repo_id=repo.id)
     
     return {"message": "Embedding started in the background", "status": "embedding"}
+
+
+@router.post("/{repo_id}/search")
+async def search_repository(
+    repo_id: int, 
+    search_req: SearchQuery, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Searches the repository's embedded code chunks based on semantic similarity."""
+    repo = await RepositoryService.get_repository(db, repo_id)
+    
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if repo.status != "ready":
+        raise HTTPException(status_code=400, detail=f"Repository not ready for search. Current status: {repo.status}")
+
+    # Execute vector search
+    try:
+        results = SearchService.search_codebase(repo_id, search_req.query, search_req.limit)
+        return {"query": search_req.query, "results": results}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")

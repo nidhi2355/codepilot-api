@@ -2,22 +2,15 @@ import os
 import logging
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
-from qdrant_client import QdrantClient
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
-from sentence_transformers import SentenceTransformer
 from api.database import SessionLocal
 from api.models.repository import Repository, RepositoryFile
 
+# Import the shared instances
+from services.vector_store import qdrant, model, COLLECTION_NAME
+
 logger = logging.getLogger(__name__)
 
-# Initialize local Qdrant
-QDRANT_PATH = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "qdrant"))
-os.makedirs(QDRANT_PATH, exist_ok=True)
-qdrant = QdrantClient(path=QDRANT_PATH)
-COLLECTION_NAME = "code_chunks"
-
-# Load the open-source embedding model
-model = SentenceTransformer("all-MiniLM-L6-v2")
 
 # Ensure Qdrant collection exists
 try:
@@ -87,6 +80,7 @@ class EmbeddingService:
                         collection_name=COLLECTION_NAME,
                         points=points
                     )
+                    print(f"DEBUG: Successfully embedded {len(points)} chunks into Qdrant!")
 
                 repo_obj.status = "ready"
                 await db.commit()
