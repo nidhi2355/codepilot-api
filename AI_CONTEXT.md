@@ -21,12 +21,11 @@ CodePilot is an Agentic AI Software Engineer designed to autonomously understand
 - [x] Created `/` (home) and `/health` endpoints.
 - [x] Configured DevPod/Podman development environment.
 - [x] Set up async SQLAlchemy with SQLite for local development.
-- [x] Created database models and Pydantic schemas for Repositories.
-- [x] Implemented `POST /repositories` endpoint with asynchronous `GitPython` cloning.
-- [x] Implemented `GET /repositories/{id}` and `GET /repositories` for status polling.
-- [x] Implemented Phase 3 Tree-sitter Code Parsing for Python files.
-- [x] Created `POST /repositories/{id}/index` to trigger background AST extraction.
+- [x] Implemented Phase 2 (Ingestion) with async `GitPython` cloning.
+- [x] Implemented Phase 3 (Parsing) with Tree-sitter AST extraction.
+- [x] Implemented Phase 4 (Vectorization) with `sentence-transformers` and local Qdrant.
+- [x] Implemented Phase 5 (Hybrid Retrieval) with a semantic search endpoint.
 
 ## Current Status & Next Action
-* **Status**: The API can now clone repositories and run an AST parser over Python files to extract structural symbols into the database.
-* **Next Step**: Begin Phase 4 (Code Knowledge Base) by generating text chunks and preparing the vector embedding pipeline for Qdrant.
+* **Status**: Core backend infrastructure is operational. The API can ingest code, parse syntax, generate embeddings, and execute semantic search. 
+* **Next Step**: Phase 6 (Agentic API endpoints) - Integrating a prompt builder that feeds the retrieved context into an LLM for autonomous code generation.

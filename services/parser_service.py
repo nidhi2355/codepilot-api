@@ -79,7 +79,7 @@ class ParserService:
             captures = SYMBOL_QUERY.captures(tree.root_node)
 
             # Save symbols
-            for node, capture_name in captures.items():
+            for node, capture_name in captures:
                 symbol = Symbol(
                     file_id=repo_file.id,
                     name=content[node.start_byte:node.end_byte],
