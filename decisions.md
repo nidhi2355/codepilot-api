@@ -54,3 +54,8 @@ This document tracks the core architectural decisions, technical trade-offs, and
 **Decision:** Returning an array of top results (Limit = 3 to 5) rather than just the highest-scoring chunk.
 **Rationale:**
 * Semantic search maps meaning, not exact keywords. Sometimes the exact answer (e.g., `api/database.py`) scores slightly lower than a file that heavily discusses the topic (e.g., `services/git_service.py`). By passing the "Top-K" chunks to the LLM, we give the AI enough surrounding context to deduce the perfect answer.
+
+### 8. Agentic API & LLM Integration (Groq & Llama 3.1)
+* **Decision**: Integrated the Groq API using `llama-3.1-8b-instant` for the final RAG generation step.
+* **Reasoning**: While earlier phases focused on strict local execution (SQLite, Qdrant, CPU-based `sentence-transformers`), running a local generation LLM inside a DevPod container would severely throttle memory and CPU. Groq provides near-instant inference, making the RAG pipeline highly responsive.
+* **Trade-off**: This introduces an external API dependency, but the speed and reliability gains for code generation heavily outweigh the memory constraints of containerized local development.

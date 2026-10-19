@@ -8,6 +8,8 @@ from services.parser_service import ParserService
 from services.embedding_service import EmbeddingService
 from api.schemas.search import SearchQuery
 from services.search_service import SearchService
+from api.schemas.chat import ChatRequest
+from services.llm_service import LLMService
 
 router = APIRouter(prefix="/repositories", tags=["Repositories"])
 
@@ -21,6 +23,11 @@ async def add_repository(
     try:
         repo = await RepositoryService.create_repository(db, repo_in)
         
+        # FIX: If the repo is already processed, reset it to trigger a fresh sync
+        if repo.status == "ready":
+            repo.status = "pending"
+            await db.commit()
+            
         if repo.status in ["pending", "error"]:
             print(f"DEBUG: Triggering background task for {repo.github_url}")
             background_tasks.add_task(
@@ -113,3 +120,36 @@ async def search_repository(
         return {"query": search_req.query, "results": results}
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Search failed: {str(e)}")
+
+
+@router.post("/{repo_id}/ask")
+async def ask_repository(
+    repo_id: int, 
+    chat_req: ChatRequest, 
+    db: AsyncSession = Depends(get_db)
+):
+    """Retrieves code context and generates an LLM answer."""
+    repo = await RepositoryService.get_repository(db, repo_id)
+    
+    if not repo:
+        raise HTTPException(status_code=404, detail="Repository not found")
+    if repo.status != "ready":
+        raise HTTPException(status_code=400, detail="Repository not ready. Embeddings must be generated first.")
+
+    try:
+        # 1. Retrieve relevant chunks using existing SearchService
+        search_results = SearchService.search_codebase(repo_id, chat_req.query, chat_req.limit)
+        
+        # 2. Pass chunks and query to the LLM
+        llm_response = LLMService.generate_answer(chat_req.query, search_results)
+        
+        # 3. Deduplicate file paths to show which files were referenced
+        referenced_files = list(set([res["file_path"] for res in search_results]))
+        
+        return {
+            "query": chat_req.query,
+            "answer": llm_response,
+            "context_files": referenced_files
+        }
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate answer: {str(e)}")
