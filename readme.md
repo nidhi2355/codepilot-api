@@ -8,7 +8,7 @@ CodePilot is an Agentic AI Software Engineer designed to autonomously ingest, un
 *   **Database:** SQLite (Relational State), Qdrant (Vector Store)
 *   **AST Parsing:** Tree-sitter (Python) for precise structural extraction
 *   **Embeddings:** Sentence-Transformers (`all-MiniLM-L6-v2`)
-*   **LLM Engine:** Groq API (`llama3-8b-8192` / `openai/gpt-oss-120b`)
+*   **LLM Engine:** Groq API (`openai/gpt-oss-120b`)
 *   **Environment:** DevPod, Docker, Pytest
 
 ## ⚙️ Features
