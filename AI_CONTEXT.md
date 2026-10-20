@@ -22,10 +22,11 @@ CodePilot is an Agentic AI Software Engineer designed to autonomously understand
 - [x] Set up async SQLAlchemy with SQLite for local development.
 - [x] Implemented Phase 2 (Ingestion) with async `GitPython` cloning.
 - [x] Implemented Phase 3 (Parsing) with Tree-sitter AST extraction, fixing the list tuple iteration bug.
-- [x] Implemented Phase 4 (Vectorization) with `sentence-transformers` and local Qdrant, resolving file lock collisions via a centralized `vector_store.py`.
+- [x] Implemented Phase 4 (Vectorization) with `sentence-transformers` and local Qdrant.
 - [x] Implemented Phase 5 (Hybrid Retrieval) with a semantic search endpoint.
-- [x] Implemented Phase 6 (Agentic API & LLM Integration) using Groq and Llama 3.1 for context-aware code QA.
+- [x] Implemented Phase 6 (Agentic API & LLM Integration) using Groq.
+- [x] Implemented Phase 7.1 (Unit Testing) with `pytest` and `httpx`.
 
 ## Current Status & Next Action
-* **Status**: CodePilot API is fully functional end-to-end. It can clone, index, embed, retrieve, and answer complex codebase queries autonomously.
-* **Next Step**: Phase 7 - Code refactoring, edge-case error handling, writing unit tests, and finalizing the API documentation.
+* **Status**: CodePilot API core is fully operational. Asynchronous test infrastructure is configured and verified.
+* **Next Step**: Phase 7.2 - Implement global FastAPI exception handlers for robust error structuring, followed by API metadata polish.
