@@ -59,3 +59,8 @@ This document tracks the core architectural decisions, technical trade-offs, and
 * **Decision**: Integrated the Groq API using `llama-3.1-8b-instant` for the final RAG generation step.
 * **Reasoning**: While earlier phases focused on strict local execution (SQLite, Qdrant, CPU-based `sentence-transformers`), running a local generation LLM inside a DevPod container would severely throttle memory and CPU. Groq provides near-instant inference, making the RAG pipeline highly responsive.
 * **Trade-off**: This introduces an external API dependency, but the speed and reliability gains for code generation heavily outweigh the memory constraints of containerized local development.
+
+### 9. Refactoring, Edge Cases, and Polish
+* **Decision**: Adopted `pytest`, `pytest-asyncio`, and `httpx` for asynchronous API unit testing.
+* **Reasoning**: The standard `TestClient` from FastAPI is synchronous. Because CodePilot relies heavily on async database sessions, async Git tasks, and async API routes, using `httpx.AsyncClient` with `ASGITransport` ensures tests run natively against the async event loop without needing a live Uvicorn server.
+* **Trade-off**: Introduces a slightly steeper learning curve for async testing fixtures, but accurately simulates real-world production traffic and prevents async-sync blocking errors during automated CI/CD runs.
