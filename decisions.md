@@ -74,3 +74,7 @@ This document tracks the core architectural decisions, technical trade-offs, and
 * **Decision**: Enriched Pydantic models with `Field` metadata, constraints (`ge`, `le`), and schema examples.
 * **Reasoning**: A production-grade API must have self-documenting endpoints. Using Pydantic's built-in validation metadata automatically generates comprehensive OpenAPI (Swagger) specifications without polluting the routing logic with descriptive text. This ensures front-end clients know exactly what payloads are expected.
 * **Trade-off**: Requires slightly more verbose schema definitions, but eliminates the need to maintain separate API documentation files.
+
+### Final Phase: Project Wrap-Up & Portfolio Polish
+* **Decision**: Drafted a developer-centric `README.md` focusing on system architecture, setup, and features.
+* **Reasoning**: For technical interviews and portfolio visibility, a repository is only as good as its README. Clearly defining the RAG pipeline components (Tree-sitter + Qdrant + Groq) demonstrates a deep understanding of modern LLM system design.
