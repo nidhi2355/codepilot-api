@@ -69,3 +69,8 @@ This document tracks the core architectural decisions, technical trade-offs, and
 * **Decision**: Implemented global application-level exception handlers using FastAPI's `@app.exception_handler`.
 * **Reasoning**: Scattered `try/except` blocks across routing and service layers lead to code duplication and inconsistent API error formats. A centralized handler ensures that all client errors (400s) and server crashes (500s) return a standardized JSON schema (`{"error": "...", "message": "..."}`).
 * **Trade-off**: Generic 500 error messages mask internal tracebacks from the client for security, which means developers must rely entirely on the server logs to debug unhandled edge cases.
+
+### 11: API Documentation & Schema Polish
+* **Decision**: Enriched Pydantic models with `Field` metadata, constraints (`ge`, `le`), and schema examples.
+* **Reasoning**: A production-grade API must have self-documenting endpoints. Using Pydantic's built-in validation metadata automatically generates comprehensive OpenAPI (Swagger) specifications without polluting the routing logic with descriptive text. This ensures front-end clients know exactly what payloads are expected.
+* **Trade-off**: Requires slightly more verbose schema definitions, but eliminates the need to maintain separate API documentation files.
