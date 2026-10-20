@@ -64,3 +64,8 @@ This document tracks the core architectural decisions, technical trade-offs, and
 * **Decision**: Adopted `pytest`, `pytest-asyncio`, and `httpx` for asynchronous API unit testing.
 * **Reasoning**: The standard `TestClient` from FastAPI is synchronous. Because CodePilot relies heavily on async database sessions, async Git tasks, and async API routes, using `httpx.AsyncClient` with `ASGITransport` ensures tests run natively against the async event loop without needing a live Uvicorn server.
 * **Trade-off**: Introduces a slightly steeper learning curve for async testing fixtures, but accurately simulates real-world production traffic and prevents async-sync blocking errors during automated CI/CD runs.
+
+### 10: Global Exception Handling
+* **Decision**: Implemented global application-level exception handlers using FastAPI's `@app.exception_handler`.
+* **Reasoning**: Scattered `try/except` blocks across routing and service layers lead to code duplication and inconsistent API error formats. A centralized handler ensures that all client errors (400s) and server crashes (500s) return a standardized JSON schema (`{"error": "...", "message": "..."}`).
+* **Trade-off**: Generic 500 error messages mask internal tracebacks from the client for security, which means developers must rely entirely on the server logs to debug unhandled edge cases.
