@@ -7,5 +7,5 @@ gitpython
 fastembed
 python-dotenv
 groq
-tree-sitter
-tree-sitter-python
+tree-sitter==0.21.3
+tree-sitter-python==0.21.0
