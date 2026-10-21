@@ -1,5 +1,6 @@
 import os
 import logging
+import tempfile
 from git import Repo
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
@@ -11,7 +12,9 @@ from qdrant_client.http.models import Filter, FieldCondition, MatchValue
 
 logger = logging.getLogger(__name__)
 
-REPOS_DIR = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "repos"))
+# Use the system's temporary directory for stateless deployment
+temp_dir = tempfile.gettempdir()
+REPOS_DIR = os.path.join(temp_dir, "codepilot_repos")
 os.makedirs(REPOS_DIR, exist_ok=True)
 
 class GitService:
@@ -32,10 +35,10 @@ class GitService:
                     local_repo = Repo(target_path)
                     local_repo.remotes.origin.pull()
 
-                    # 1. Clear old files and symbols from SQLite 
+                    # 1. Clear old files and symbols from PostgreSQL 
                     await db.execute(delete(RepositoryFile).where(RepositoryFile.repository_id == repo_id))
                     
-                    # 2. Clear old vectors from Qdrant
+                    # 2. Clear old vectors from Qdrant Cloud
                     try:
                         qdrant.delete(
                             collection_name=COLLECTION_NAME,
