@@ -7,3 +7,5 @@ gitpython
 fastembed
 python-dotenv
 groq
+tree-sitter
+tree-sitter-python
