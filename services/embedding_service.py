@@ -60,7 +60,7 @@ class EmbeddingService:
                         if not chunk_text.strip():
                             continue
 
-                        vector = model.encode(chunk_text).tolist()
+                        vector = list(model.encode(chunk_text))[0]
 
                         points.append(
                             PointStruct(
