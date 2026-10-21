@@ -1,28 +1,26 @@
-from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
-from sqlalchemy.orm import declarative_base
+import os
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
+from sqlalchemy.orm import sessionmaker, declarative_base
+from dotenv import load_dotenv
 
-# SQLite connection string. To switch to PostgreSQL later, just change this URL.
-SQLALCHEMY_DATABASE_URL = "sqlite+aiosqlite:///./codepilot.db"
+load_dotenv()
 
-engine = create_async_engine(
-    SQLALCHEMY_DATABASE_URL, 
-    connect_args={"check_same_thread": False} # Needed only for SQLite
-)
+# Fallback to local SQLite if DATABASE_URL is not set (useful for local testing)
+DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/codepilot.db")
 
-SessionLocal = async_sessionmaker(
-    autocommit=False, 
-    autoflush=False, 
+# SQLite requires specific connect args to prevent thread issues. Postgres does not.
+connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+
+engine = create_async_engine(DATABASE_URL, echo=False, connect_args=connect_args)
+
+SessionLocal = sessionmaker(
     bind=engine, 
     class_=AsyncSession, 
-    expire_on_commit=False  # Added this parameter
+    expire_on_commit=False
 )
 
 Base = declarative_base()
 
 async def get_db():
-    """Dependency to provide a database session for each request."""
-    db = SessionLocal()
-    try:
-        yield db
-    finally:
-        await db.close()
+    async with SessionLocal() as session:
+        yield session
