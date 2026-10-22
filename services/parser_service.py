@@ -10,7 +10,7 @@ from api.models.repository import Repository, RepositoryFile, Symbol
 logger = logging.getLogger(__name__)
 
 # Initialize Tree-sitter for Python
-PY_LANGUAGE = Language(tspython.language())
+PY_LANGUAGE = Language(tspython.language(), "python")
 parser = Parser(PY_LANGUAGE)
 
 # Query to find class and function names in Python
