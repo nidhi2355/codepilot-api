@@ -11,7 +11,7 @@ class SearchService:
         # Search Qdrant, filtering strictly by the requested repository ID
         search_result =qdrant.query_points(
             collection_name=COLLECTION_NAME,
-            query_vector=query_vector,
+            query=query_vector,
             query_filter=Filter(
                 must=[
                     FieldCondition(
