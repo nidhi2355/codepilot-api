@@ -78,3 +78,15 @@ This document tracks the core architectural decisions, technical trade-offs, and
 ### Final Phase: Project Wrap-Up & Portfolio Polish
 * **Decision**: Drafted a developer-centric `README.md` focusing on system architecture, setup, and features.
 * **Reasoning**: For technical interviews and portfolio visibility, a repository is only as good as its README. Clearly defining the RAG pipeline components (Tree-sitter + Qdrant + Groq) demonstrates a deep understanding of modern LLM system design.
+
+### 12: LangGraph State Management (`TypedDict` vs Pydantic)
+* **Context**: LangGraph requires a strongly typed state object to pass context (tasks, plans, retrieved code) between nodes like the Planner, Coder, and Tester.
+* **Decision**: Chose standard Python `TypedDict` over `Pydantic` models for the core `AgentState`.
+* **Reasoning**: LangGraph's internal channel management and state reducers (like `operator.add` for appending to lists) interact much more cleanly and predictably with native Python dictionaries (`TypedDict`) than with Pydantic class instances. This avoids serialization overhead and validation crashes mid-graph execution.
+* **Trade-off**: We lose Pydantic's automatic runtime type coercion and validation for the graph state, meaning nodes must be strictly coded to respect the expected types.
+
+### 13: Structured LLM Output for Agent Routing (LangChain & Pydantic)
+* **Context**: The Planner Agent needs to return an exact list of strings (the plan) so the LangGraph state `plan` array updates correctly. Raw LLM string outputs are too unpredictable for programmatic agent routing.
+* **Decision**: Integrated `langchain-groq` and used `.with_structured_output(PlanOutput)` backed by a Pydantic model.
+* **Reasoning**: This forces the Llama 3.1 model on Groq to output reliable JSON matching our schema. LangChain handles the underlying JSON schema prompting and parsing automatically, preventing the application from crashing due to malformed string parsing.
+* **Trade-off**: Adds `langchain-core` and `langchain-groq` as dependencies, slightly increasing the project footprint, but drastically improves the reliability of the agentic state machine.
