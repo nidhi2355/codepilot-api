@@ -6,7 +6,7 @@ class SearchService:
     def search_codebase(repo_id: int, query: str, limit: int = 5):
         """Embeds the query and searches Qdrant for matching code chunks."""
         # Convert the user query into a vector
-        query_vector = list(model.encode(query))[0]
+        query_vector = list(model.embed([query]))[0].tolist()
         
         # Search Qdrant, filtering strictly by the requested repository ID
         search_result = qdrant.search(
