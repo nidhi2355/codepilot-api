@@ -9,7 +9,7 @@ class Repository(Base):
     github_url = Column(String, unique=True, index=True, nullable=False)
     name = Column(String, nullable=False)
     status = Column(String, default="pending")
-    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc))
+    created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
 
 class RepositoryFile(Base):
     __tablename__ = "repository_files"
