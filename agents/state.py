@@ -5,6 +5,7 @@ class AgentState(TypedDict):
     Maintains the state of the LangGraph execution.
     """
     repo_id: int
+    repo_path: str
     task: str
     plan: List[str]
     retrieved_context: List[Dict[str, Any]]
