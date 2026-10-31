@@ -1,5 +1,9 @@
 import os
+import uuid
+import tempfile
+import shutil
 import logging
+from git import Repo
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.future import select
 from qdrant_client.http.models import Distance, VectorParams, PointStruct
@@ -10,7 +14,6 @@ from api.models.repository import Repository, RepositoryFile
 from services.vector_store import qdrant, model, COLLECTION_NAME
 
 logger = logging.getLogger(__name__)
-
 
 # Ensure Qdrant collection exists
 try:
@@ -39,52 +42,59 @@ class EmbeddingService:
 
                 files_result = await db.execute(select(RepositoryFile).filter(RepositoryFile.repository_id == repo_id))
                 repo_files = files_result.scalars().all()
-                repo_dir = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", "data", "repos", repo_obj.name))
+                
+                # 1. Create a stateless temporary directory
+                temp_dir = tempfile.mkdtemp()
+                try:
+                    # 2. Clone the repo explicitly so the files actually exist to be read
+                    Repo.clone_from(repo_obj.github_url, temp_dir, depth=1)
 
-                points = []
-                point_id = 1 
+                    points = []
 
-                for file_record in repo_files:
-                    abs_path = os.path.join(repo_dir, file_record.path)
-                    if not os.path.exists(abs_path):
-                        continue
-
-                    with open(abs_path, "r", encoding="utf-8") as f:
-                        content = f.read()
-
-                    # Basic line-based chunking (~50 lines per chunk)
-                    lines = content.split('\n')
-                    chunk_size = 50
-                    for i in range(0, len(lines), chunk_size):
-                        chunk_text = '\n'.join(lines[i:i + chunk_size])
-                        if not chunk_text.strip():
+                    for file_record in repo_files:
+                        abs_path = os.path.join(temp_dir, file_record.path)
+                        if not os.path.exists(abs_path):
                             continue
 
-                        vector = list(model.embed([chunk_text]))[0].tolist()
+                        with open(abs_path, "r", encoding="utf-8") as f:
+                            content = f.read()
 
-                        points.append(
-                            PointStruct(
-                                id=point_id,
-                                vector=vector,
-                                payload={
-                                    "repo_id": repo_id,
-                                    "file_path": file_record.path,
-                                    "content": chunk_text
-                                }
+                        # Basic line-based chunking (~50 lines per chunk)
+                        lines = content.split('\n')
+                        chunk_size = 50
+                        for i in range(0, len(lines), chunk_size):
+                            chunk_text = '\n'.join(lines[i:i + chunk_size])
+                            if not chunk_text.strip():
+                                continue
+
+                            vector = list(model.embed([chunk_text]))[0].tolist()
+
+                            points.append(
+                                PointStruct(
+                                    id=str(uuid.uuid4()),  # 3. Use UUIDs to prevent vector overwriting!
+                                    vector=vector,
+                                    payload={
+                                        "repo_id": repo_id,
+                                        "file_path": file_record.path,
+                                        "content": chunk_text
+                                    }
+                                )
                             )
+
+                    if points:
+                        qdrant.upsert(
+                            collection_name=COLLECTION_NAME,
+                            points=points
                         )
-                        point_id += 1
+                        print(f"DEBUG: Successfully embedded {len(points)} chunks into Qdrant!")
 
-                if points:
-                    qdrant.upsert(
-                        collection_name=COLLECTION_NAME,
-                        points=points
-                    )
-                    print(f"DEBUG: Successfully embedded {len(points)} chunks into Qdrant!")
+                    repo_obj.status = "ready"
+                    await db.commit()
+                    logger.info(f"Successfully generated vectors for {repo_obj.name}")
 
-                repo_obj.status = "ready"
-                await db.commit()
-                logger.info(f"Successfully generated vectors for {repo_obj.name}")
+                finally:
+                    # 4. Guarantee cleanup of the ephemeral drive
+                    shutil.rmtree(temp_dir, ignore_errors=True)
 
             except Exception as e:
                 logger.error(f"Failed to embed repository {repo_id}: {str(e)}")
