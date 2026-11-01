@@ -41,10 +41,10 @@ def coding_node(state: AgentState) -> dict:
             "Output the exact file paths and the FULL updated code for those files.\n\n"
             "{format_instructions}"
         )),
-        ("human", "Task: {task}\n\nPlan: {plan}\n\nRetrieved Context: {context}")
+        # Added {errors} to the human prompt so it sees the reflection feedback
+        ("human", "Task: {task}\n\nPlan: {plan}\n\nRetrieved Context: {context}\n\nPrevious Errors/Feedback: {errors}")
     ])
     
-    # Chain uses the LLM directly, then pipes output to the parser
     chain = prompt | llm | parser
     
     try:
@@ -53,26 +53,13 @@ def coding_node(state: AgentState) -> dict:
             for chunk in state.get("retrieved_context", [])
         ])
         
-        # We pass format_instructions from the parser into the prompt
         result_dict = chain.invoke({
             "task": state["task"],
             "plan": "\n".join(state.get("plan", [])),
             "context": context_str,
+            "errors": "\n".join(state.get("errors", [])), # Inject the feedback
             "format_instructions": parser.get_format_instructions()
         })
-        
-        # The parser returns a dictionary, so we validate it back into our Pydantic model
-        result = CodingOutput(**result_dict)
-        
-        modified_files = []
-        for mod in result.modifications:
-            os.makedirs(os.path.dirname(mod.file_path) or ".", exist_ok=True)
-            with open(mod.file_path, "w", encoding="utf-8") as f:
-                f.write(mod.new_content)
-            modified_files.append(mod.file_path)
-            logger.info(f"Successfully modified: {mod.file_path}")
-            
-        return {"modified_files": modified_files}
     
     except Exception as e:
         logger.error(f"Coding failed: {str(e)}")
