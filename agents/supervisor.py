@@ -6,6 +6,7 @@ from agents.retriever import retrieve_node
 from agents.coding import coding_node
 from agents.testing import execute_tests_node
 from agents.reflection import reflection_node
+from agents.pr_creator import pr_creation_node # Added import
 
 logger = logging.getLogger(__name__)
 
@@ -17,8 +18,8 @@ def route_after_testing(state: AgentState) -> str:
     MAX_RETRIES = 3
     
     if passed:
-        logger.info("Tests passed. Routing to END.")
-        return END
+        logger.info("Tests passed. Routing to PR creation.")
+        return "pr_creator" # Updated destination
     elif retry_count >= MAX_RETRIES:
         logger.warning(f"Max retries ({MAX_RETRIES}) reached. Routing to END with failure.")
         return END
@@ -35,16 +36,17 @@ def create_agent_workflow() -> StateGraph:
     workflow.add_node("coding", coding_node)
     workflow.add_node("testing", execute_tests_node)
     workflow.add_node("reflection", reflection_node)
+    workflow.add_node("pr_creator", pr_creation_node) # Added node
     
     workflow.set_entry_point("planner")
     workflow.add_edge("planner", "retriever")
     workflow.add_edge("retriever", "coding")
     workflow.add_edge("coding", "testing")
     
-    # Conditional logic based on test success or failure
     workflow.add_conditional_edges("testing", route_after_testing)
-    
-    # After reflecting, loop back to try coding again
     workflow.add_edge("reflection", "coding")
+    
+    # Route PR creator to END
+    workflow.add_edge("pr_creator", END) 
     
     return workflow
