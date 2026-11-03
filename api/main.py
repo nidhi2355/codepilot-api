@@ -5,6 +5,7 @@ from api.database import engine, Base
 from api.routes.base import router as base_router
 from api.routes.repositories import router as repo_router
 import logging
+from api.routes import agent
 
 logging.basicConfig(level=logging.INFO)
 
@@ -41,6 +42,7 @@ def create_app() -> FastAPI:
     
     app.include_router(base_router)
     app.include_router(repo_router)
+    app.include_router(agent.router)
     
     return app
 

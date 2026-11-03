@@ -9,9 +9,9 @@ class SearchService:
         query_vector = list(model.embed([query]))[0].tolist()
         
         # Search Qdrant, filtering strictly by the requested repository ID
-        search_result =qdrant.query_points(
+        search_result = qdrant.search(
             collection_name=COLLECTION_NAME,
-            query=query_vector,
+            query_vector=query_vector, # Changed from query to query_vector
             query_filter=Filter(
                 must=[
                     FieldCondition(
@@ -21,7 +21,7 @@ class SearchService:
                 ]
             ),
             limit=limit
-        ).points
+        )
         
         # Format and return the payload data
         results = []
