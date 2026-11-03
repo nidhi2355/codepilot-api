@@ -60,7 +60,31 @@ def coding_node(state: AgentState) -> dict:
             "errors": "\n".join(state.get("errors", [])), # Inject the feedback
             "format_instructions": parser.get_format_instructions()
         })
-    
+        
+        # --- RESTORED AND UPDATED BLOCK ---
+        result = CodingOutput(**result_dict)
+        
+        repo_path = state.get("repo_path", ".")
+        modified_files = []
+        
+        for mod in result.modifications:
+            # Combine the sandbox directory with the relative file name
+            full_path = os.path.join(repo_path, mod.file_path)
+            
+            # Create directories based on the full path
+            os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+            
+            # Write the file to the sandbox directory
+            with open(full_path, "w", encoding="utf-8") as f:
+                f.write(mod.new_content)
+                
+            # Keep the relative path for Git tracking in the PR creator
+            modified_files.append(mod.file_path) 
+            logger.info(f"Successfully modified: {full_path}")
+            
+        return {"modified_files": modified_files}
+        # --- END OF RESTORED AND UPDATED BLOCK ---
+
     except Exception as e:
         logger.error(f"Coding failed: {str(e)}")
         return {"errors": [f"Coding Error: {str(e)}"]}

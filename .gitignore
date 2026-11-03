@@ -6,3 +6,5 @@ __pycache__/
 .env
 command.txt
 .env
+# Agent Sandbox
+tests/dummy_repo/
