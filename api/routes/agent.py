@@ -1,5 +1,7 @@
+import json
 import logging
 from fastapi import APIRouter, HTTPException
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel
 from agents.supervisor import create_agent_workflow
 from agents.state import AgentState
@@ -12,44 +14,48 @@ class TaskRequest(BaseModel):
     repo_path: str
     task: str
 
+async def stream_agent_execution(request: TaskRequest):
+    """Generator function that yields LangGraph state updates as Server-Sent Events (SSE)."""
+    initial_state = AgentState(
+        repo_id=request.repo_id,
+        repo_path=request.repo_path,
+        task=request.task,
+        plan=[],
+        retrieved_context=[],
+        modified_files=[],
+        test_results={},
+        retry_count=0,
+        status="starting",
+        errors=[]
+    )
+    
+    workflow = create_agent_workflow()
+    app = workflow.compile()
+    
+    try:
+        # .astream() yields a dict of the state update every time a node finishes
+        async for output in app.astream(initial_state):
+            for node_name, state_update in output.items():
+                logger.info(f"Completed node: {node_name}")
+                
+                # Format the payload for SSE ("data: <json>\n\n")
+                payload = {
+                    "node": node_name,
+                    "state_update": state_update
+                }
+                yield f"data: {json.dumps(payload)}\n\n"
+                
+        # Send a final termination event
+        yield f"data: {json.dumps({'node': 'end', 'status': 'completed'})}\n\n"
+        
+    except Exception as e:
+        logger.error(f"Streaming failed: {str(e)}")
+        yield f"data: {json.dumps({'error': str(e)})}\n\n"
+
 @router.post("/run")
 async def run_autonomous_agent(request: TaskRequest):
     """
-    Triggers the end-to-end LangGraph autonomous coding workflow.
+    Triggers the end-to-end LangGraph autonomous workflow and streams progress.
     """
-    logger.info(f"Starting agent workflow for repo_id {request.repo_id}")
-    
-    try:
-        # 1. Initialize the LangGraph state
-        initial_state = AgentState(
-            repo_id=request.repo_id,
-            repo_path=request.repo_path,
-            task=request.task,
-            plan=[],
-            retrieved_context=[],
-            modified_files=[],
-            test_results={},
-            retry_count=0,
-            status="starting",
-            errors=[]
-        )
-        
-        # 2. Compile and execute the workflow
-        workflow = create_agent_workflow()
-        app = workflow.compile()
-        
-        # This will block until the graph reaches the END node
-        final_state = app.invoke(initial_state)
-        
-        # 3. Return a clean summary of the execution
-        return {
-            "message": "Autonomous workflow completed.",
-            "modified_files": final_state.get("modified_files", []),
-            "test_results": final_state.get("test_results", {}),
-            "retry_count": final_state.get("retry_count", 0),
-            "errors": final_state.get("errors", [])
-        }
-        
-    except Exception as e:
-        logger.error(f"Agent workflow failed: {str(e)}")
-        raise HTTPException(status_code=500, detail=f"Agent workflow error: {str(e)}")
+    logger.info(f"Starting SSE agent workflow for repo_id {request.repo_id}")
+    return StreamingResponse(stream_agent_execution(request), media_type="text/event-stream")
