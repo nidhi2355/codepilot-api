@@ -1,30 +1,42 @@
 import os
-from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession
-from sqlalchemy.orm import sessionmaker, declarative_base
+from urllib.parse import urlparse, parse_qs, urlencode, urlunparse
+from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
+from sqlalchemy.orm import declarative_base
 from dotenv import load_dotenv
-from sqlalchemy.pool import NullPool
 
 load_dotenv()
 
-# Fallback to local SQLite if DATABASE_URL is not set (useful for local testing)
-DATABASE_URL = os.getenv("DATABASE_URL", "sqlite+aiosqlite:///./data/codepilot.db")
+def get_async_database_url() -> str:
+    raw_url = os.getenv("DATABASE_URL", "")
+    if not raw_url:
+        raise ValueError("DATABASE_URL environment variable is not set.")
 
-# SQLite requires specific connect args to prevent thread issues. Postgres does not.
-connect_args = {"check_same_thread": False} if DATABASE_URL.startswith("sqlite") else {}
+    if raw_url.startswith("postgres://"):
+        raw_url = raw_url.replace("postgres://", "postgresql+asyncpg://", 1)
+    elif raw_url.startswith("postgresql://"):
+        raw_url = raw_url.replace("postgresql://", "postgresql+asyncpg://", 1)
+
+    parsed = urlparse(raw_url)
+    query_params = parse_qs(parsed.query)
+    query_params.pop("sslmode", None)
+    query_params.pop("channel_binding", None)
+
+    clean_query = urlencode(query_params, doseq=True)
+    return urlunparse(parsed._replace(query=clean_query))
+
+DATABASE_URL = get_async_database_url()
 
 engine = create_async_engine(
     DATABASE_URL,
-    poolclass=NullPool, # Disables SQLAlchemy's internal pooling
-    connect_args={
-        "prepared_statement_cache_size": 0,
-        "statement_cache_size": 0,
-    }
+    echo=False,
+    pool_pre_ping=True,
+    connect_args={"ssl": "require"} if "localhost" not in DATABASE_URL else {},
 )
 
-SessionLocal = sessionmaker(
-    bind=engine, 
-    class_=AsyncSession, 
-    expire_on_commit=False
+SessionLocal = async_sessionmaker(
+    bind=engine,
+    class_=AsyncSession,
+    expire_on_commit=False,
 )
 
 Base = declarative_base()
