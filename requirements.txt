@@ -2,7 +2,6 @@ fastapi
 uvicorn
 sqlalchemy[asyncio]
 asyncpg
-qdrant-client
 gitpython
 fastembed
 python-dotenv
@@ -12,3 +11,5 @@ tree-sitter-python==0.21.0
 langgraph>=0.1.0
 langchain-groq>=0.1.9
 langchain-core>=0.2.0
+qdrant-client>=1.16.0
+pytest
