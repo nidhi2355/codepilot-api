@@ -1,13 +1,16 @@
-from fastapi import FastAPI, Request, HTTPException
-from fastapi.responses import JSONResponse
+import os
+import logging
 from contextlib import asynccontextmanager
+from fastapi import FastAPI, Request, HTTPException
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from api.database import engine, Base
 from api.routes.base import router as base_router
 from api.routes.repositories import router as repo_router
-import logging
 from api.routes import agent
 
 logging.basicConfig(level=logging.INFO)
+
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -16,6 +19,7 @@ async def lifespan(app: FastAPI):
     yield
     await engine.dispose()
 
+
 def create_app() -> FastAPI:
     app = FastAPI(
         title="CodePilot API",
@@ -23,8 +27,21 @@ def create_app() -> FastAPI:
         version="0.1.0",
         lifespan=lifespan
     )
-    
-    # --- Global Exception Handlers ---
+
+    origins = [
+        o.strip()
+        for o in os.getenv("ALLOWED_ORIGINS", "http://localhost:3000").split(",")
+        if o.strip()
+    ]
+
+    app.add_middleware(
+        CORSMiddleware,
+        allow_origins=origins,
+        allow_credentials=True,
+        allow_methods=["*"],
+        allow_headers=["*"],
+    )
+
     @app.exception_handler(HTTPException)
     async def http_exception_handler(request: Request, exc: HTTPException):
         return JSONResponse(
@@ -39,12 +56,13 @@ def create_app() -> FastAPI:
             status_code=500,
             content={"error": "Internal Server Error", "message": "An unexpected error occurred on the server."}
         )
-    
+
     app.include_router(base_router)
     app.include_router(repo_router)
     app.include_router(agent.router)
-    
+
     return app
+
 
 app = create_app()
 
