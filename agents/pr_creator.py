@@ -128,9 +128,16 @@ def pr_creation_node(state: AgentState) -> dict:
         })
 
         pr_body = pr_details["body"].strip()
-        if issue_number and f"#{issue_number}" not in pr_body:
-            pr_body += f"\n\n## Related Issue\nFixes #{issue_number}"
+        if issue_number:
+            has_closing_keyword = re.search(
+                rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{issue_number}\b",
+                pr_body,
+                re.IGNORECASE,
+            )
+            if not has_closing_keyword:
+                pr_body += f"\n\nCloses #{issue_number}"
 
+        
         actor = Actor("CodePilot Bot", "codepilot-bot@users.noreply.github.com")
         commit_message = f"{pr_details['title']}\n\n{pr_body}"
         repo.index.commit(commit_message, author=actor, committer=actor)
