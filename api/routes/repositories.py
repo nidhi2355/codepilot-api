@@ -3,7 +3,10 @@ import logging
 from fastapi import APIRouter, Depends, HTTPException, BackgroundTasks
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.database import get_db, SessionLocal
+from api.dependencies.auth import get_current_user
+from api.models.user import User
 from api.schemas.repository import RepositoryCreate, RepositoryResponse
+from services.crypto_service import decrypt_token
 from services.repository_service import RepositoryService
 from services.git_service import GitService
 from services.parser_service import ParserService
@@ -23,14 +26,23 @@ async def _run_step(fn, **kwargs):
     return fn(**kwargs)
 
 
-async def ingest_repository_pipeline(repo_id: int, github_url: str):
+async def ingest_repository_pipeline(
+    repo_id: int, github_url: str, github_token: str | None = None
+):
     """Runs clone -> index -> embed end-to-end in the background."""
-    await _run_step(GitService.clone_repository_task, repo_id=repo_id, github_url=github_url)
+    await _run_step(
+        GitService.clone_repository_task,
+        repo_id=repo_id,
+        github_url=github_url,
+        github_token=github_token,
+    )
 
     async with SessionLocal() as db:
         repo = await RepositoryService.get_repository(db, repo_id)
         if not repo or repo.status != "cloned":
-            logger.error(f"Stopping pipeline for repo {repo_id}: status is {repo.status if repo else 'missing'}")
+            logger.error(
+                f"Stopping pipeline for repo {repo_id}: status is {repo.status if repo else 'missing'}"
+            )
             return
 
     await _run_step(ParserService.index_repository_task, repo_id=repo_id)
@@ -38,7 +50,9 @@ async def ingest_repository_pipeline(repo_id: int, github_url: str):
     async with SessionLocal() as db:
         repo = await RepositoryService.get_repository(db, repo_id)
         if not repo or repo.status != "indexed":
-            logger.error(f"Stopping pipeline for repo {repo_id}: status is {repo.status if repo else 'missing'}")
+            logger.error(
+                f"Stopping pipeline for repo {repo_id}: status is {repo.status if repo else 'missing'}"
+            )
             return
 
     await _run_step(EmbeddingService.embed_repository_task, repo_id=repo_id)
@@ -49,10 +63,12 @@ async def add_repository(
     repo_in: RepositoryCreate,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    """Accepts a GitHub URL, saves it, and runs clone -> index -> embed in the background."""
+    """Accepts a GitHub URL for the current user and runs clone -> index -> embed."""
     try:
-        repo = await RepositoryService.create_repository(db, repo_in)
+        repo = await RepositoryService.create_repository(db, repo_in, current_user.id)
+        github_token = decrypt_token(current_user.encrypted_github_token)
 
         if repo.status == "ready":
             repo.status = "pending"
@@ -63,6 +79,7 @@ async def add_repository(
                 ingest_repository_pipeline,
                 repo_id=repo.id,
                 github_url=repo.github_url,
+                github_token=github_token,
             )
 
         return repo
@@ -72,17 +89,24 @@ async def add_repository(
 
 
 @router.get("/{repo_id}", response_model=RepositoryResponse)
-async def get_repository(repo_id: int, db: AsyncSession = Depends(get_db)):
-    repo = await RepositoryService.get_repository(db, repo_id)
+async def get_repository(
+    repo_id: int,
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    repo = await RepositoryService.get_repository(db, repo_id, current_user.id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
     return repo
 
 
 @router.get("/", response_model=list[RepositoryResponse])
-async def list_repositories(db: AsyncSession = Depends(get_db)):
+async def list_repositories(
+    db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
     try:
-        return await RepositoryService.get_repositories(db)
+        return await RepositoryService.get_repositories(db, current_user.id)
     except Exception:
         raise HTTPException(status_code=500, detail="Failed to retrieve repositories")
 
@@ -92,8 +116,9 @@ async def index_repository(
     repo_id: int,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    repo = await RepositoryService.get_repository(db, repo_id)
+    repo = await RepositoryService.get_repository(db, repo_id, current_user.id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
     if repo.status != "cloned":
@@ -108,12 +133,16 @@ async def embed_repository(
     repo_id: int,
     background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    repo = await RepositoryService.get_repository(db, repo_id)
+    repo = await RepositoryService.get_repository(db, repo_id, current_user.id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
     if repo.status != "indexed":
-        raise HTTPException(status_code=400, detail=f"Cannot embed repository in status: {repo.status}. Must be 'indexed'.")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Cannot embed repository in status: {repo.status}. Must be 'indexed'.",
+        )
 
     background_tasks.add_task(EmbeddingService.embed_repository_task, repo_id=repo.id)
     return {"message": "Embedding started in the background", "status": "embedding"}
@@ -124,12 +153,16 @@ async def search_repository(
     repo_id: int,
     search_req: SearchQuery,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    repo = await RepositoryService.get_repository(db, repo_id)
+    repo = await RepositoryService.get_repository(db, repo_id, current_user.id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
     if repo.status != "ready":
-        raise HTTPException(status_code=400, detail=f"Repository not ready for search. Current status: {repo.status}")
+        raise HTTPException(
+            status_code=400,
+            detail=f"Repository not ready for search. Current status: {repo.status}",
+        )
 
     try:
         results = SearchService.search_codebase(repo_id, search_req.query, search_req.limit)
@@ -143,12 +176,15 @@ async def ask_repository(
     repo_id: int,
     chat_req: ChatRequest,
     db: AsyncSession = Depends(get_db),
+    current_user: User = Depends(get_current_user),
 ):
-    repo = await RepositoryService.get_repository(db, repo_id)
+    repo = await RepositoryService.get_repository(db, repo_id, current_user.id)
     if not repo:
         raise HTTPException(status_code=404, detail="Repository not found")
     if repo.status != "ready":
-        raise HTTPException(status_code=400, detail="Repository not ready. Embeddings must be generated first.")
+        raise HTTPException(
+            status_code=400, detail="Repository not ready. Embeddings must be generated first."
+        )
 
     try:
         search_results = SearchService.search_codebase(repo_id, chat_req.query, chat_req.limit)
