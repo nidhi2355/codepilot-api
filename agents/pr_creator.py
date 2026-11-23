@@ -143,7 +143,7 @@ def pr_creation_node(state: AgentState) -> dict:
         repo.index.commit(commit_message, author=actor, committer=actor)
         logger.info(f"Committed changes to branch: {branch_name}")
 
-        github_token = os.getenv("GITHUB_TOKEN")
+        github_token = state.get("github_token") or os.getenv("GITHUB_TOKEN")
         if not github_token:
             logger.warning("GITHUB_TOKEN is not set. Skipping push and GitHub PR creation.")
             repo.heads[base_branch].checkout()

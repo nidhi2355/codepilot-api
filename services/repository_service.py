@@ -6,30 +6,35 @@ from api.schemas.repository import RepositoryCreate
 
 logger = logging.getLogger(__name__)
 
+
 class RepositoryService:
     @staticmethod
-    async def create_repository(db: AsyncSession, repo_data: RepositoryCreate) -> Repository:
+    async def create_repository(
+        db: AsyncSession, repo_data: RepositoryCreate, user_id: int
+    ) -> Repository:
         try:
-            # Extract repo name from URL (e.g., https://github.com/user/repo -> repo)
             repo_url_str = str(repo_data.github_url).rstrip("/")
             repo_name = repo_url_str.split("/")[-1]
 
-            # Check if it already exists
-            result = await db.execute(select(Repository).filter(Repository.github_url == repo_url_str))
+            result = await db.execute(
+                select(Repository).filter(
+                    Repository.user_id == user_id,
+                    Repository.github_url == repo_url_str,
+                )
+            )
             existing_repo = result.scalars().first()
             if existing_repo:
                 return existing_repo
 
-            # Create new record
             new_repo = Repository(
+                user_id=user_id,
                 github_url=repo_url_str,
                 name=repo_name,
-                status="pending"
+                status="pending",
             )
             db.add(new_repo)
             await db.commit()
             await db.refresh(new_repo)
-            
             return new_repo
         except Exception as e:
             await db.rollback()
@@ -37,13 +42,22 @@ class RepositoryService:
             raise e
 
     @staticmethod
-    async def get_repository(db: AsyncSession, repo_id: int) -> Repository | None:
-        """Fetches a single repository by its database ID."""
-        result = await db.execute(select(Repository).filter(Repository.id == repo_id))
+    async def get_repository(
+        db: AsyncSession, repo_id: int, user_id: int | None = None
+    ) -> Repository | None:
+        """Fetches a single repository by ID, scoped to user_id when provided."""
+        query = select(Repository).filter(Repository.id == repo_id)
+        if user_id is not None:
+            query = query.filter(Repository.user_id == user_id)
+        result = await db.execute(query)
         return result.scalars().first()
 
     @staticmethod
-    async def get_repositories(db: AsyncSession) -> list[Repository]:
-        """Fetches all repositories."""
-        result = await db.execute(select(Repository))
+    async def get_repositories(db: AsyncSession, user_id: int) -> list[Repository]:
+        """Fetches all repositories owned by the authenticated user."""
+        result = await db.execute(
+            select(Repository)
+            .filter(Repository.user_id == user_id)
+            .order_by(Repository.created_at.desc())
+        )
         return result.scalars().all()

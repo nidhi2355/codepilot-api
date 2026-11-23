@@ -1,4 +1,5 @@
-from typing import List, Dict, Any, TypedDict
+from typing import List, Dict, Any, Optional, TypedDict
+
 
 class AgentState(TypedDict):
     """
@@ -7,6 +8,8 @@ class AgentState(TypedDict):
     repo_id: int
     repo_path: str
     task: str
+    issue_number: Optional[int]
+    github_token: Optional[str]
     plan: List[str]
     retrieved_context: List[Dict[str, Any]]
     modified_files: List[str]
