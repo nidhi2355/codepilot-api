@@ -1,17 +1,17 @@
-import asyncio
+import inspect
 import json
 import logging
-import os
 from typing import Optional
 from fastapi import APIRouter, Depends, HTTPException
 from fastapi.responses import StreamingResponse
-from git import Repo
 from pydantic import BaseModel
 from sqlalchemy.ext.asyncio import AsyncSession
 from api.database import get_db
 from agents.supervisor import create_agent_workflow
 from agents.state import AgentState
-from services.git_service import REPOS_DIR
+from services.git_service import GitService
+from services.parser_service import ParserService
+from services.embedding_service import EmbeddingService
 from services.repository_service import RepositoryService
 
 logger = logging.getLogger(__name__)
@@ -22,6 +22,12 @@ class TaskRequest(BaseModel):
     repo_id: int
     task: str
     repo_path: Optional[str] = None
+
+
+async def _run_step(fn, **kwargs):
+    if inspect.iscoroutinefunction(fn):
+        return await fn(**kwargs)
+    return fn(**kwargs)
 
 
 async def stream_agent_execution(repo_id: int, repo_path: str, task: str):
@@ -72,12 +78,23 @@ async def run_autonomous_agent(
         if not repo:
             raise HTTPException(status_code=404, detail="Repository not found")
 
-        repo_name = repo.github_url.rstrip("/").split("/")[-1]
-        resolved_path = os.path.join(REPOS_DIR, repo_name)
+        resolved_path, needs_reindex, current_sha = await GitService.ensure_fresh_repo(
+            repo.id, repo.github_url
+        )
 
-        if not os.path.exists(resolved_path):
-            logger.info(f"Re-cloning {repo.github_url} into {resolved_path}")
-            await asyncio.to_thread(Repo.clone_from, repo.github_url, resolved_path)
+        if needs_reindex:
+            logger.info(f"Auto-syncing index and embeddings for repo {repo.id} at {current_sha}")
+            await _run_step(ParserService.index_repository_task, repo_id=repo.id)
+            await _run_step(EmbeddingService.embed_repository_task, repo_id=repo.id)
+
+            await db.refresh(repo)
+            if repo.status != "ready":
+                raise HTTPException(
+                    status_code=500,
+                    detail=f"Repository re-indexing failed (status: {repo.status})",
+                )
+
+            await GitService.save_indexed_sha(repo.id, current_sha)
 
     logger.info(f"Starting SSE agent workflow for repo_id {request.repo_id} at {resolved_path}")
     return StreamingResponse(
