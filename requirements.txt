@@ -13,3 +13,5 @@ langchain-groq>=0.1.9
 langchain-core>=0.2.0
 qdrant-client>=1.16.0
 pytest
+cryptography
+PyJWT
