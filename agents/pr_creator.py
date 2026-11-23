@@ -2,6 +2,7 @@ import os
 import re
 import uuid
 import logging
+from typing import Optional
 import httpx
 from git import Repo, Actor
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ logger = logging.getLogger(__name__)
 class PRDetails(BaseModel):
     title: str = Field(description="A concise, descriptive title for the pull request.")
     body: str = Field(
-        description="A detailed markdown description of the changes made, explaining the 'why' and 'how'."
+        description="A factual markdown description of the exact changes in the diff."
     )
 
 
@@ -28,12 +29,31 @@ def _parse_github_owner_repo(remote_url: str) -> tuple[str, str]:
     return match.group(1), match.group(2)
 
 
+def _extract_issue_number(state: AgentState) -> Optional[int]:
+    """Extracts the GitHub issue number from explicit state or the task text."""
+    explicit = state.get("issue_number")
+    if explicit:
+        return int(explicit)
+
+    task = state.get("task", "")
+    patterns = [
+        r"github\.com/[^/\s]+/[^/\s]+/issues/(\d+)",
+        r"\bissue\s*#?\s*(\d+)\b",
+        r"(?:^|\s)#(\d+)\b",
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, task, re.IGNORECASE)
+        if match:
+            return int(match.group(1))
+    return None
+
+
 def pr_creation_node(state: AgentState) -> dict:
     """
-    LangGraph node: Generates PR details, commits and pushes a new branch,
-    and opens a real Pull Request on GitHub.
+    LangGraph node: Stages changes, generates a diff-grounded PR summary with
+    GitHub issue-closing syntax, commits and pushes a feature branch, and opens a PR.
     """
-    logger.info("PR Creation Agent: Generating PR details and opening pull request...")
+    logger.info("PR Creation Agent: Preparing diff and opening pull request...")
 
     modified_files = state.get("modified_files", [])
     if not modified_files:
@@ -41,11 +61,21 @@ def pr_creation_node(state: AgentState) -> dict:
         return {"status": "completed"}
 
     existing_test_results = dict(state.get("test_results") or {})
+    repo_path = state.get("repo_path", ".")
+
+    if not os.path.exists(os.path.join(repo_path, ".git")):
+        logger.warning(f"No .git directory found in {repo_path}. Simulating PR creation.")
+        existing_test_results["pr_url"] = "simulated_pr_url"
+        return {"status": "pr_created", "test_results": existing_test_results}
+
+    repo = Repo(repo_path)
+    base_branch = repo.active_branch.name
+    branch_name = f"codepilot-fix-{uuid.uuid4().hex[:8]}"
 
     llm = ChatGroq(
         model="openai/gpt-oss-120b",
         api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0.2,
+        temperature=0.1,
     )
 
     parser = JsonOutputParser(pydantic_object=PRDetails)
@@ -54,44 +84,55 @@ def pr_creation_node(state: AgentState) -> dict:
         (
             "system",
             (
-                "You are a senior software engineer opening a pull request. "
-                "Based on the original task, the execution plan, and the files modified, "
-                "write a clear, professional PR title and a markdown-formatted body. "
-                "Mention that the changes were automatically tested and verified.\n\n"
+                "You are a senior software engineer opening a pull request.\n"
+                "Rules you MUST follow:\n"
+                "1. STRICT DIFF GROUNDING: State ONLY changes explicitly present in the provided Git Diff. "
+                "NEVER speculate, guess, or use hedging phrases like 'or adjusted logic', 'likely', or 'may have'.\n"
+                "2. STRUCTURE: Write a clear PR title and a concise markdown body with sections "
+                "'## Summary', '## Changes', and '## Verification' (noting automated pytest verification).\n"
+                "3. ISSUE LINKING: If an Issue Closing Keyword (e.g., 'Fixes #1') is provided, include a "
+                "'## Related Issue' section containing that exact keyword so GitHub closes the issue on merge.\n\n"
                 "{format_instructions}"
             ),
         ),
-        ("human", "Task: {task}\n\nPlan: {plan}\n\nModified Files: {files}"),
+        (
+            "human",
+            "Task: {task}\n\n"
+            "Issue Closing Keyword: {issue_keyword}\n\n"
+            "Modified Files: {files}\n\n"
+            "Git Diff:\n```diff\n{git_diff}\n```",
+        ),
     ])
 
     chain = prompt | llm | parser
 
     try:
+        # Checkout feature branch and stage modified files first so git diff captures both edits and new files
+        new_branch = repo.create_head(branch_name)
+        new_branch.checkout()
+        repo.index.add(modified_files)
+
+        staged_diff = repo.git.diff("--cached")
+        if len(staged_diff) > 8000:
+            staged_diff = staged_diff[:8000] + "\n... [diff truncated]"
+
+        issue_number = _extract_issue_number(state)
+        issue_keyword = f"Fixes #{issue_number}" if issue_number else "None"
+
         pr_details = chain.invoke({
             "task": state["task"],
-            "plan": "\n".join(state.get("plan", [])),
+            "issue_keyword": issue_keyword,
             "files": ", ".join(modified_files),
+            "git_diff": staged_diff or "(no diff content)",
             "format_instructions": parser.get_format_instructions(),
         })
 
-        repo_path = state.get("repo_path", ".")
-        if not os.path.exists(os.path.join(repo_path, ".git")):
-            logger.warning(f"No .git directory found in {repo_path}. Simulating PR creation.")
-            existing_test_results["pr_url"] = "simulated_pr_url"
-            return {"status": "pr_created", "test_results": existing_test_results}
+        pr_body = pr_details["body"].strip()
+        if issue_number and f"#{issue_number}" not in pr_body:
+            pr_body += f"\n\n## Related Issue\nFixes #{issue_number}"
 
-        repo = Repo(repo_path)
-        base_branch = repo.active_branch.name
-        branch_name = f"codepilot-fix-{uuid.uuid4().hex[:8]}"
-
-        # Create and checkout feature branch
-        new_branch = repo.create_head(branch_name)
-        new_branch.checkout()
-
-        # Stage and commit with explicit author
-        repo.index.add(modified_files)
         actor = Actor("CodePilot Bot", "codepilot-bot@users.noreply.github.com")
-        commit_message = f"{pr_details['title']}\n\n{pr_details['body']}"
+        commit_message = f"{pr_details['title']}\n\n{pr_body}"
         repo.index.commit(commit_message, author=actor, committer=actor)
         logger.info(f"Committed changes to branch: {branch_name}")
 
@@ -107,7 +148,6 @@ def pr_creation_node(state: AgentState) -> dict:
         owner, repo_name = _parse_github_owner_repo(original_url)
         auth_url = f"https://x-access-token:{github_token}@github.com/{owner}/{repo_name}.git"
 
-        # Push branch using authenticated URL, then restore clean remote URL
         try:
             origin.set_url(auth_url)
             push_info = origin.push(refspec=f"{branch_name}:{branch_name}")
@@ -120,7 +160,6 @@ def pr_creation_node(state: AgentState) -> dict:
 
         logger.info(f"Pushed branch {branch_name} to {owner}/{repo_name}")
 
-        # Open Pull Request via GitHub REST API
         pr_response = httpx.post(
             f"https://api.github.com/repos/{owner}/{repo_name}/pulls",
             headers={
@@ -130,7 +169,7 @@ def pr_creation_node(state: AgentState) -> dict:
             },
             json={
                 "title": pr_details["title"],
-                "body": pr_details["body"],
+                "body": pr_body,
                 "head": branch_name,
                 "base": base_branch,
             },
@@ -145,4 +184,9 @@ def pr_creation_node(state: AgentState) -> dict:
 
     except Exception as e:
         logger.error(f"PR Creation failed: {str(e)}")
+        try:
+            if repo.active_branch.name != base_branch:
+                repo.heads[base_branch].checkout()
+        except Exception:
+            pass
         return {"errors": [f"PR Creation Error: {str(e)}"]}
