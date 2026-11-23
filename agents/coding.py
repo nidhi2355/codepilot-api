@@ -37,6 +37,27 @@ class CodingOutput(BaseModel):
     )
 
 
+def _is_test_file(path: str) -> bool:
+    norm = path.replace("\\", "/").lstrip("./")
+    base = os.path.basename(norm)
+    return (
+        norm.startswith("tests/")
+        or "/tests/" in norm
+        or base.startswith("test_")
+        or base.endswith("_test.py")
+    )
+
+
+def _is_test_only_task(task: str) -> bool:
+    return bool(
+        re.search(
+            r"^\s*(?:add|write|create|update)\s+(?:unit\s+)?tests?\b|\btests?\s+only\b",
+            task.strip(),
+            re.IGNORECASE,
+        )
+    )
+
+
 def _get_repo_files(repo_path: str, limit: int = 200) -> List[str]:
     files: List[str] = []
     if not repo_path or not os.path.exists(repo_path):
@@ -51,57 +72,64 @@ def _get_repo_files(repo_path: str, limit: int = 200) -> List[str]:
     return sorted(files)
 
 
-def _discover_matching_test_files(
+def _collect_full_target_files(
     repo_path: str,
     repo_files: List[str],
     retrieved_chunks: list,
     plan: List[str],
     task: str,
-) -> List[tuple[str, str]]:
+) -> dict[str, str]:
     """
-    Finds existing test files (e.g. tests/test_<module>.py) matching referenced source
-    modules even if Qdrant did not rank them in top-K.
+    Resolves all target source and matching test files and reads their COMPLETE
+    contents directly from disk so the LLM never reconstructs missing lines.
     """
-    already_loaded: Set[str] = {
-        chunk.get("file_path", "").replace("\\", "/").lstrip("./")
-        for chunk in retrieved_chunks
-    }
+    target_paths: Set[str] = set()
+    plan_and_task = "\n".join(plan) + "\n" + task
 
-    candidate_stems: Set[str] = set()
-    for path in already_loaded:
+    # 1. Any file surfaced by retrieval
+    for chunk in retrieved_chunks:
+        fp = chunk.get("file_path", "").replace("\\", "/").lstrip("./")
+        if fp in repo_files:
+            target_paths.add(fp)
+
+    # 2. Any repo file explicitly mentioned by path or module filename in plan/task
+    mentioned_names = set(re.findall(r"([a-zA-Z0-9_./-]+\.py)", plan_and_task))
+    for rel_path in repo_files:
+        base = os.path.basename(rel_path)
+        if rel_path in plan_and_task or base in mentioned_names:
+            target_paths.add(rel_path)
+
+    # 3. Matching test files (e.g. tests/test_<module>.py) for every candidate source module
+    stems: Set[str] = set()
+    for path in list(target_paths):
         base = os.path.basename(path)
         if base.endswith(".py") and not base.startswith("test_") and base != "__init__.py":
-            candidate_stems.add(base[:-3])
+            stems.add(base[:-3])
 
-    for match in re.findall(r"([a-zA-Z0-9_]+)\.py", "\n".join(plan) + "\n" + task):
-        if not match.startswith("test_") and match != "__init__":
-            candidate_stems.add(match)
-
-    discovered: List[tuple[str, str]] = []
     for rel_path in repo_files:
-        if rel_path in already_loaded:
-            continue
         base = os.path.basename(rel_path)
-        if any(base in (f"test_{stem}.py", f"{stem}_test.py") for stem in candidate_stems):
-            full_path = os.path.join(repo_path, rel_path)
+        if any(base in (f"test_{stem}.py", f"{stem}_test.py") for stem in stems):
+            target_paths.add(rel_path)
+
+    full_files: dict[str, str] = {}
+    for rel_path in sorted(target_paths):
+        full_path = os.path.join(repo_path, rel_path)
+        if os.path.isfile(full_path):
             try:
                 with open(full_path, "r", encoding="utf-8") as f:
-                    discovered.append((rel_path, f.read()))
-                already_loaded.add(rel_path)
+                    full_files[rel_path] = f.read()
             except Exception as e:
-                logger.warning(f"Could not read test file {rel_path}: {e}")
-        if len(discovered) >= 4:
-            break
+                logger.warning(f"Failed to read full file {rel_path}: {e}")
 
-    return discovered
+    return full_files
 
 
 def coding_node(state: AgentState) -> dict:
     """
-    LangGraph node: Generates code patches based on the plan and retrieved context,
+    LangGraph node: Loads complete target files from disk, generates minimal code patches,
     and writes them to the filesystem.
     """
-    logger.info("Coding Agent: Generating code modifications...")
+    logger.info("Coding Agent: Loading full target files and generating modifications...")
 
     llm = ChatGroq(
         model="openai/gpt-oss-120b",
@@ -115,22 +143,26 @@ def coding_node(state: AgentState) -> dict:
         (
             "system",
             (
-                "You are an expert autonomous software engineer. "
-                "Follow the provided plan to fix the user's issue. "
-                "Use the Repository File Tree and Retrieved Context to ensure your changes match exact existing file paths, "
-                "imports, and function signatures.\n"
-                "Test Hygiene & Coverage Rules:\n"
-                "- Prefer adding new tests to existing test files matching the modified module (e.g., `tests/test_<module>.py`). "
-                "Only create a new test file if no corresponding module test file exists in the Repository File Tree.\n"
-                "- Whenever you modify or add production code, always include corresponding unit tests in `modifications`.\n"
-                "Output the exact relative file paths and the FULL updated code for those files.\n\n"
+                "You are an expert autonomous software engineer.\n"
+                "Rules you MUST follow:\n"
+                "1. COMPLETE FILE INTEGRITY: Existing files to edit are provided in full under "
+                "'Complete Target Files From Disk'. Preserve every existing class attribute, dataclass field, "
+                "default value, import, function, and existing test character-for-character unless the task "
+                "explicitly asks to change or remove it.\n"
+                "2. NEVER OVERWRITE PARTIAL FILES: Do not modify an existing file unless its full content was "
+                "provided in 'Complete Target Files From Disk'.\n"
+                "3. COMPLETE IMPLEMENTATION: For bug-fix and feature tasks, always output BOTH the source code "
+                "changes AND the corresponding unit tests in `modifications`.\n"
+                "4. TEST HYGIENE: Prefer adding tests to the matching existing module test file "
+                "(e.g., `tests/test_<module>.py`) rather than creating new test files.\n\n"
                 "{format_instructions}"
             ),
         ),
         (
             "human",
-            "Task: {task}\n\nRepository File Tree:\n{file_tree}\n\nPlan: {plan}\n\n"
-            "Retrieved Context:\n{context}\n\nPrevious Errors/Feedback:\n{errors}",
+            "Task: {task}\n\nRepository File Tree:\n{file_tree}\n\nPlan:\n{plan}\n\n"
+            "Complete Target Files From Disk:\n{full_files}\n\n"
+            "Additional Reference Snippets:\n{snippets}\n\nPrevious Errors/Feedback:\n{errors}",
         ),
     ])
 
@@ -141,34 +173,58 @@ def coding_node(state: AgentState) -> dict:
     file_tree_str = "\n".join(repo_files) if repo_files else "(no files found)"
 
     retrieved_chunks = state.get("retrieved_context", [])
-    context_parts = [
-        f"--- File: {chunk.get('file_path')} ---\n{chunk.get('content')}"
-        for chunk in retrieved_chunks
-    ]
-
-    for test_path, test_content in _discover_matching_test_files(
+    full_files_map = _collect_full_target_files(
         repo_path, repo_files, retrieved_chunks, state.get("plan", []), state["task"]
-    ):
-        logger.info(f"Auto-included matching existing test file in coding context: {test_path}")
-        context_parts.append(f"--- Existing Test File: {test_path} ---\n{test_content}")
+    )
 
-    context_str = "\n\n".join(context_parts)
+    full_files_str = "\n\n".join([
+        f"=== Complete File: {path} ===\n{content}"
+        for path, content in full_files_map.items()
+    ]) or "(none)"
+
+    snippets_str = "\n\n".join([
+        f"--- Snippet: {chunk.get('file_path')} ---\n{chunk.get('content')}"
+        for chunk in retrieved_chunks
+        if chunk.get("file_path", "").replace("\\", "/").lstrip("./") not in full_files_map
+    ]) or "(none)"
+
     errors_list = list(state.get("errors", []))
+    require_source_edit = not _is_test_only_task(state["task"])
 
     result = None
     last_error = None
 
-    for attempt in range(2):
+    for attempt in range(3):
         try:
             result_dict = chain.invoke({
                 "task": state["task"],
                 "file_tree": file_tree_str,
                 "plan": "\n".join(state.get("plan", [])),
-                "context": context_str,
+                "full_files": full_files_str,
+                "snippets": snippets_str,
                 "errors": "\n".join(errors_list),
                 "format_instructions": parser.get_format_instructions(),
             })
-            result = CodingOutput(**result_dict)
+            candidate = CodingOutput(**result_dict)
+
+            # Reject test-only first attempts on implementation tasks before wasting a pytest cycle
+            if (
+                require_source_edit
+                and attempt < 2
+                and candidate.modifications
+                and all(_is_test_file(m.file_path) for m in candidate.modifications)
+            ):
+                logger.warning(
+                    f"Coding attempt {attempt + 1} only modified test files; re-prompting for source edits."
+                )
+                errors_list.append(
+                    "Your previous output only modified test files and omitted the required source code "
+                    "implementation. Include BOTH the source file edits (e.g., under src/) and the test "
+                    "file updates in `modifications`."
+                )
+                continue
+
+            result = candidate
             break
         except (ValidationError, ValueError, TypeError) as e:
             last_error = e
@@ -188,11 +244,27 @@ def coding_node(state: AgentState) -> dict:
     try:
         modified_files = []
         for mod in result.modifications:
-            full_path = os.path.join(repo_path, mod.file_path)
+            norm_path = mod.file_path.replace("\\", "/").lstrip("./")
+            full_path = os.path.join(repo_path, norm_path)
+
+            # Guard against overwriting an existing file that was never loaded in full from disk
+            if os.path.exists(full_path) and norm_path not in full_files_map:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    full_files_map[norm_path] = f.read()
+                logger.warning(
+                    f"Blocked blind overwrite of unloaded existing file {norm_path}; loaded full file for retry."
+                )
+                return {
+                    "errors": [
+                        f"Coding Error: Attempted to overwrite existing file '{norm_path}' without reading "
+                        "its full contents first. Retry with full file context."
+                    ]
+                }
+
             os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(mod.new_content)
-            modified_files.append(mod.file_path)
+            modified_files.append(norm_path)
             logger.info(f"Successfully modified: {full_path}")
 
         return {"modified_files": modified_files}
