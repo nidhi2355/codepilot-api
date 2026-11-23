@@ -5,9 +5,10 @@ from fastapi import FastAPI, Request, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from api.database import engine, Base
+from api.models import user as _user_model  # noqa: F401
 from api.routes.base import router as base_router
 from api.routes.repositories import router as repo_router
-from api.routes import agent
+from api.routes import agent, auth
 
 logging.basicConfig(level=logging.INFO)
 
@@ -25,7 +26,7 @@ def create_app() -> FastAPI:
         title="CodePilot API",
         description="Agentic AI Software Engineer for Repository Understanding and Autonomous Coding",
         version="0.1.0",
-        lifespan=lifespan
+        lifespan=lifespan,
     )
 
     origins = [
@@ -46,7 +47,7 @@ def create_app() -> FastAPI:
     async def http_exception_handler(request: Request, exc: HTTPException):
         return JSONResponse(
             status_code=exc.status_code,
-            content={"error": "Client Error", "message": exc.detail}
+            content={"error": "Client Error", "message": exc.detail},
         )
 
     @app.exception_handler(Exception)
@@ -54,10 +55,14 @@ def create_app() -> FastAPI:
         logging.error(f"Unhandled Exception on {request.url}: {str(exc)}")
         return JSONResponse(
             status_code=500,
-            content={"error": "Internal Server Error", "message": "An unexpected error occurred on the server."}
+            content={
+                "error": "Internal Server Error",
+                "message": "An unexpected error occurred on the server.",
+            },
         )
 
     app.include_router(base_router)
+    app.include_router(auth.router)
     app.include_router(repo_router)
     app.include_router(agent.router)
 

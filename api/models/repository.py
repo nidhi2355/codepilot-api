@@ -1,16 +1,22 @@
-from sqlalchemy import Column, Integer, String, DateTime, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, ForeignKey, UniqueConstraint
 from datetime import datetime, timezone
 from api.database import Base
 
+
 class Repository(Base):
     __tablename__ = "repositories"
+    __table_args__ = (
+        UniqueConstraint("user_id", "github_url", name="uq_user_repo_url"),
+    )
 
     id = Column(Integer, primary_key=True, index=True)
-    github_url = Column(String, unique=True, index=True, nullable=False)
+    user_id = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True, index=True)
+    github_url = Column(String, index=True, nullable=False)
     name = Column(String, nullable=False)
     status = Column(String, default="pending")
     last_indexed_sha = Column(String, nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc).replace(tzinfo=None))
+
 
 class RepositoryFile(Base):
     __tablename__ = "repository_files"
@@ -19,6 +25,7 @@ class RepositoryFile(Base):
     repository_id = Column(Integer, ForeignKey("repositories.id", ondelete="CASCADE"))
     path = Column(String, nullable=False)
     language = Column(String)
+
 
 class Symbol(Base):
     __tablename__ = "symbols"
