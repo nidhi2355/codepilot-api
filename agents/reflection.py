@@ -5,7 +5,6 @@ from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import JsonOutputParser
 from agents.state import AgentState
-from agents.supervisor import audit_diff_regressions
 
 logger = logging.getLogger(__name__)
 
@@ -31,6 +30,8 @@ def reflection_node(state: AgentState) -> dict:
     new_errors = list(state.get("errors", []))
 
     if passed:
+        from agents.supervisor import audit_diff_regressions
+
         violations = audit_diff_regressions(
             state.get("repo_path", "."), modified_files, state.get("task", "")
         )
