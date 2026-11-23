@@ -5,6 +5,7 @@ from typing import List
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
+from langchain_core.output_parsers import JsonOutputParser
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -53,12 +54,15 @@ def plan_node(state: AgentState) -> dict:
         temperature=0.2,
     )
 
+    parser = JsonOutputParser(pydantic_object=PlanOutput)
+
     repo_files = _get_repo_files(state.get("repo_path", "."))
     file_tree_str = "\n".join(repo_files) if repo_files else "(no files found)"
 
+    context_chunks = state.get("retrieved_context", [])[:6]
     context_str = "\n\n".join([
-        f"--- File: {chunk.get('file_path')} ---\n{chunk.get('content')}"
-        for chunk in state.get("retrieved_context", [])
+        f"--- File: {chunk.get('file_path')} ---\n{str(chunk.get('content', ''))[:1000]}"
+        for chunk in context_chunks
     ]) or "(no retrieved chunks)"
 
     prompt = ChatPromptTemplate.from_messages([
@@ -75,7 +79,9 @@ def plan_node(state: AgentState) -> dict:
                 "Git/PR steps (e.g., 'commit', 'push', 'create branch', 'open PR')—those are automated.\n"
                 "3. TEST COVERAGE: Always include a step to add or update unit tests in the matching existing test file "
                 "(e.g., `tests/test_<module>.py`) if one exists in the file tree.\n"
-                "4. FLAT LIST: Return a flat list of single-line steps with NO nested sub-bullets, NO sub-lists, and NO actual code."
+                "4. FLAT LIST: Return a flat JSON list of single-line strings under `steps` with NO nested sub-bullets, "
+                "NO sub-lists, and NO actual code.\n\n"
+                "{format_instructions}"
             ),
         ),
         (
@@ -84,20 +90,23 @@ def plan_node(state: AgentState) -> dict:
         ),
     ])
 
-    structured_llm = llm.with_structured_output(PlanOutput)
-    chain = prompt | structured_llm
+    chain = prompt | llm | parser
 
     try:
-        result = chain.invoke({
+        result_dict = chain.invoke({
             "task": state["task"],
             "file_tree": file_tree_str,
             "context": context_str,
+            "format_instructions": parser.get_format_instructions(),
         })
 
-        # Normalize numbering to guarantee strictly sequential 1..N formatting
+        raw_steps = result_dict.get("steps", []) if isinstance(result_dict, dict) else []
+        if isinstance(raw_steps, str):
+            raw_steps = [line for line in raw_steps.splitlines() if line.strip()]
+
         cleaned_steps = []
-        for idx, raw_step in enumerate(result.steps, start=1):
-            single_line = " ".join(raw_step.strip().splitlines())
+        for idx, raw_step in enumerate(raw_steps, start=1):
+            single_line = " ".join(str(raw_step).strip().splitlines())
             stripped = re.sub(r"^\d+[\.\)]\s*", "", single_line).strip()
             if stripped:
                 cleaned_steps.append(f"{idx}. {stripped}")
