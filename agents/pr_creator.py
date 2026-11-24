@@ -5,7 +5,7 @@ import logging
 from typing import Optional
 import httpx
 from git import Repo, Actor
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import JsonOutputParser
@@ -51,33 +51,32 @@ def _extract_issue_number(state: AgentState) -> Optional[int]:
 def pr_creation_node(state: AgentState) -> dict:
     """
     LangGraph node: Stages changes, generates a diff-grounded PR summary with
-    GitHub issue-closing syntax, commits and pushes a feature branch, and opens a PR.
+    deterministic GitHub issue-closing syntax, pushes a branch, and opens a PR.
     """
     logger.info("PR Creation Agent: Preparing diff and opening pull request...")
 
     modified_files = state.get("modified_files", [])
     if not modified_files:
         logger.warning("No files were modified. Skipping PR creation.")
-        return {"status": "completed"}
+        return {"status": "error", "errors": ["PR Creation Skipped: No files were modified."]}
 
     existing_test_results = dict(state.get("test_results") or {})
     repo_path = state.get("repo_path", ".")
 
     if not os.path.exists(os.path.join(repo_path, ".git")):
-        logger.warning(f"No .git directory found in {repo_path}. Simulating PR creation.")
-        existing_test_results["pr_url"] = "simulated_pr_url"
-        return {"status": "pr_created", "test_results": existing_test_results}
+        logger.warning(f"No .git directory found in {repo_path}.")
+        return {"status": "error", "errors": [f"PR Creation Error: No .git repository at {repo_path}."]}
 
     repo = Repo(repo_path)
     base_branch = repo.active_branch.name
     branch_name = f"codepilot-fix-{uuid.uuid4().hex[:8]}"
 
-    llm = ChatGroq(
+    base_llm = ChatGroq(
         model="openai/gpt-oss-120b",
         api_key=os.getenv("GROQ_API_KEY"),
         temperature=0.1,
     )
-
+    llm = base_llm.bind(tool_choice="none")
     parser = JsonOutputParser(pydantic_object=PRDetails)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -87,11 +86,11 @@ def pr_creation_node(state: AgentState) -> dict:
                 "You are a senior software engineer opening a pull request.\n"
                 "Rules you MUST follow:\n"
                 "1. STRICT DIFF GROUNDING: State ONLY changes explicitly present in the provided Git Diff. "
-                "NEVER speculate, guess, or use hedging phrases like 'or adjusted logic', 'likely', or 'may have'.\n"
-                "2. STRUCTURE: Write a clear PR title and a concise markdown body with sections "
-                "'## Summary', '## Changes', and '## Verification' (noting automated pytest verification).\n"
-                "3. ISSUE LINKING: If an Issue Closing Keyword (e.g., 'Fixes #1') is provided, include a "
-                "'## Related Issue' section containing that exact keyword so GitHub closes the issue on merge.\n\n"
+                "NEVER speculate or use hedging phrases such as 'or adjusted logic', 'likely', or 'may have'.\n"
+                "2. STRUCTURE: Return a concise PR title and markdown body with sections "
+                "'## Summary', '## Changes', and '## Verification'.\n"
+                "3. ISSUE LINKING: If an Issue Closing Keyword (e.g., 'Closes #1') is provided, include a "
+                "'## Related Issue' section containing that exact keyword.\n\n"
                 "{format_instructions}"
             ),
         ),
@@ -107,7 +106,6 @@ def pr_creation_node(state: AgentState) -> dict:
     chain = prompt | llm | parser
 
     try:
-        # Checkout feature branch and stage modified files first so git diff captures both edits and new files
         new_branch = repo.create_head(branch_name)
         new_branch.checkout()
         repo.index.add(modified_files)
@@ -117,17 +115,29 @@ def pr_creation_node(state: AgentState) -> dict:
             staged_diff = staged_diff[:8000] + "\n... [diff truncated]"
 
         issue_number = _extract_issue_number(state)
-        issue_keyword = f"Fixes #{issue_number}" if issue_number else "None"
+        issue_keyword = f"Closes #{issue_number}" if issue_number else "None"
 
-        pr_details = chain.invoke({
-            "task": state["task"],
-            "issue_keyword": issue_keyword,
-            "files": ", ".join(modified_files),
-            "git_diff": staged_diff or "(no diff content)",
-            "format_instructions": parser.get_format_instructions(),
-        })
+        pr_details = None
+        last_llm_err = None
+        for attempt in range(2):
+            try:
+                raw = chain.invoke({
+                    "task": state["task"],
+                    "issue_keyword": issue_keyword,
+                    "files": ", ".join(modified_files),
+                    "git_diff": staged_diff or "(no diff content)",
+                    "format_instructions": parser.get_format_instructions(),
+                })
+                pr_details = PRDetails(**raw)
+                break
+            except (ValidationError, ValueError, TypeError) as err:
+                last_llm_err = err
+                logger.warning(f"PRDetails parse attempt {attempt + 1} failed: {err}")
 
-        pr_body = pr_details["body"].strip()
+        if pr_details is None:
+            raise RuntimeError(f"Failed to generate valid PR summary JSON: {last_llm_err}")
+
+        pr_body = pr_details.body.strip()
         if issue_number:
             has_closing_keyword = re.search(
                 rf"\b(?:close[sd]?|fix(?:e[sd])?|resolve[sd]?)\s+#{issue_number}\b",
@@ -135,20 +145,18 @@ def pr_creation_node(state: AgentState) -> dict:
                 re.IGNORECASE,
             )
             if not has_closing_keyword:
-                pr_body += f"\n\nCloses #{issue_number}"
+                pr_body += f"\n\n## Related Issue\nCloses #{issue_number}"
 
-        
         actor = Actor("CodePilot Bot", "codepilot-bot@users.noreply.github.com")
-        commit_message = f"{pr_details['title']}\n\n{pr_body}"
+        commit_message = f"{pr_details.title}\n\n{pr_body}"
         repo.index.commit(commit_message, author=actor, committer=actor)
         logger.info(f"Committed changes to branch: {branch_name}")
 
         github_token = state.get("github_token") or os.getenv("GITHUB_TOKEN")
         if not github_token:
-            logger.warning("GITHUB_TOKEN is not set. Skipping push and GitHub PR creation.")
-            repo.heads[base_branch].checkout()
-            existing_test_results["pr_url"] = f"local-branch:{branch_name} (GITHUB_TOKEN not set)"
-            return {"status": "pr_created", "test_results": existing_test_results}
+            raise RuntimeError(
+                "No GitHub access token found for this session. Sign out and sign in with GitHub again."
+            )
 
         origin = repo.remotes.origin
         original_url = origin.url
@@ -160,7 +168,10 @@ def pr_creation_node(state: AgentState) -> dict:
             push_info = origin.push(refspec=f"{branch_name}:{branch_name}")
             for info in push_info:
                 if info.flags & info.ERROR:
-                    raise RuntimeError(f"Git push failed: {info.summary}")
+                    raise RuntimeError(
+                        f"Git push to {owner}/{repo_name} failed ({info.summary.strip()}). "
+                        "Ensure your GitHub account has write access and 'repo' OAuth scope."
+                    )
         finally:
             origin.set_url(original_url)
             repo.heads[base_branch].checkout()
@@ -175,14 +186,18 @@ def pr_creation_node(state: AgentState) -> dict:
                 "X-GitHub-Api-Version": "2022-11-28",
             },
             json={
-                "title": pr_details["title"],
+                "title": pr_details.title,
                 "body": pr_body,
                 "head": branch_name,
                 "base": base_branch,
             },
             timeout=30.0,
         )
-        pr_response.raise_for_status()
+        if pr_response.status_code >= 400:
+            raise RuntimeError(
+                f"GitHub PR API returned {pr_response.status_code}: {pr_response.text}"
+            )
+
         pr_url = pr_response.json()["html_url"]
         logger.info(f"Opened Pull Request: {pr_url}")
 
@@ -196,4 +211,4 @@ def pr_creation_node(state: AgentState) -> dict:
                 repo.heads[base_branch].checkout()
         except Exception:
             pass
-        return {"errors": [f"PR Creation Error: {str(e)}"]}
+        return {"status": "error", "errors": [f"PR Creation Error: {str(e)}"]}
