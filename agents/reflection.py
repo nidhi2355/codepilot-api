@@ -4,6 +4,7 @@ from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
 from langchain_core.output_parsers import JsonOutputParser
+from agents.ast_guard import audit_diff_regressions
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -17,21 +18,25 @@ class ReflectionOutput(BaseModel):
 
 def reflection_node(state: AgentState) -> dict:
     """
-    LangGraph node: Diagnoses test failures, missing test coverage, or unintended
-    diff regressions without generating speculative code snippets.
+    LangGraph node: Diagnoses coding/test/diff failures and returns ONLY the new
+    feedback item so LangGraph's operator.add reducer appends it once.
     """
-    logger.info("Reflection Agent: Reviewing test execution and diff integrity...")
+    logger.info("Reflection Agent: Reviewing execution and diff integrity...")
 
     test_results = state.get("test_results", {})
     passed = test_results.get("passed", False)
     output = test_results.get("output", "")
     retry_count = state.get("retry_count", 0)
     modified_files = state.get("modified_files", [])
-    new_errors = list(state.get("errors", []))
 
+    # Case 1: Coding failed before running tests (empty modified_files)
+    if not modified_files:
+        latest_err = (state.get("errors") or ["Coding produced no valid file modifications."])[-1]
+        new_feedback = f"Retry {retry_count + 1} Feedback: {latest_err}"
+        return {"retry_count": retry_count + 1, "errors": [new_feedback]}
+
+    # Case 2: Pytest passed, but diff audit or test coverage gate rejected the patch
     if passed:
-        from agents.supervisor import audit_diff_regressions
-
         violations = audit_diff_regressions(
             state.get("repo_path", "."), modified_files, state.get("task", "")
         )
@@ -43,25 +48,29 @@ def reflection_node(state: AgentState) -> dict:
                 "Restore these exact attributes, default values, and functions while keeping your new changes."
             )
             logger.info(f"Reflection flagged diff regressions: {violations}")
-            new_errors.append(f"Retry {retry_count + 1} Feedback: {feedback}")
-            return {"retry_count": retry_count + 1, "errors": new_errors}
+            return {
+                "retry_count": retry_count + 1,
+                "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
+            }
 
-        source_files = ", ".join(modified_files) or "the modified modules"
+        source_files = ", ".join(modified_files)
         feedback = (
-            f"Existing tests passed, but no test files were added or updated for {source_files}. "
+            f"Tests passed, but no test files were modified alongside {source_files}. "
             "Add unit tests covering your changes in the matching existing test file "
-            "(e.g., `tests/test_<module>.py`) and include that test file in `modifications`."
+            "(e.g., `tests/test_<module>.py`)."
         )
-        logger.info(f"Reflection enforced test coverage: {feedback}")
-        new_errors.append(f"Retry {retry_count + 1} Feedback: {feedback}")
-        return {"retry_count": retry_count + 1, "errors": new_errors}
+        return {
+            "retry_count": retry_count + 1,
+            "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
+        }
 
-    llm = ChatGroq(
+    # Case 3: Pytest failed -> diagnose root cause without writing speculative code
+    base_llm = ChatGroq(
         model="openai/gpt-oss-120b",
         api_key=os.getenv("GROQ_API_KEY"),
         temperature=0.1,
     )
-
+    llm = base_llm.bind(tool_choice="none")
     parser = JsonOutputParser(pydantic_object=ReflectionOutput)
 
     prompt = ChatPromptTemplate.from_messages([
@@ -72,8 +81,7 @@ def reflection_node(state: AgentState) -> dict:
                 "Rules you MUST follow:\n"
                 "1. State ONLY the root-cause diagnosis, the exact file path and line numbers from the traceback, "
                 "and the behavioral requirement that failed.\n"
-                "2. NEVER write replacement code, code blocks, or speculative implementations—you do not have the "
-                "full source files and must not guess internal data structures.\n\n"
+                "2. NEVER write replacement code, code blocks, or speculative implementations.\n\n"
                 "{format_instructions}"
             ),
         ),
@@ -91,10 +99,13 @@ def reflection_node(state: AgentState) -> dict:
 
         feedback = result_dict.get("feedback", "No specific feedback generated.")
         logger.info(f"Reflection complete. Feedback: {feedback}")
-        new_errors.append(f"Retry {retry_count + 1} Feedback: {feedback}")
-
-        return {"retry_count": retry_count + 1, "errors": new_errors}
+        return {
+            "retry_count": retry_count + 1,
+            "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
+        }
     except Exception as e:
         logger.error(f"Reflection failed: {str(e)}")
-        new_errors.append(f"Reflection Error: {str(e)}")
-        return {"retry_count": retry_count + 1, "errors": new_errors}
+        return {
+            "retry_count": retry_count + 1,
+            "errors": [f"Reflection Error: {str(e)}"],
+        }
