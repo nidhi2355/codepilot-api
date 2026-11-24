@@ -50,10 +50,10 @@ def _extract_issue_number(state: AgentState) -> Optional[int]:
 
 def pr_creation_node(state: AgentState) -> dict:
     """
-    LangGraph node: Stages changes, generates a diff-grounded PR summary with
-    deterministic GitHub issue-closing syntax, pushes a branch, and opens a PR.
+    LangGraph node: Stages all changes with `git add -A`, generates a PR summary
+    grounded strictly in `git diff --cached`, pushes a branch, and opens a PR.
     """
-    logger.info("PR Creation Agent: Preparing diff and opening pull request...")
+    logger.info("PR Creation Agent: Staging changes and opening pull request...")
 
     modified_files = state.get("modified_files", [])
     if not modified_files:
@@ -74,7 +74,7 @@ def pr_creation_node(state: AgentState) -> dict:
     base_llm = ChatGroq(
         model="openai/gpt-oss-120b",
         api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0.1,
+        temperature=0.0,
     )
     llm = base_llm.bind(tool_choice="none")
     parser = JsonOutputParser(pydantic_object=PRDetails)
@@ -83,10 +83,11 @@ def pr_creation_node(state: AgentState) -> dict:
         (
             "system",
             (
-                "You are a senior software engineer opening a pull request.\n"
+                "You are a senior software engineer writing a pull request description from a git diff.\n"
                 "Rules you MUST follow:\n"
-                "1. STRICT DIFF GROUNDING: State ONLY changes explicitly present in the provided Git Diff. "
-                "NEVER speculate or use hedging phrases such as 'or adjusted logic', 'likely', or 'may have'.\n"
+                "1. DIFF-ONLY GROUNDING: Document ONLY files, functions, classes, and test cases that explicitly "
+                "appear in the Git Diff below. Never mention any file or test function that is not in the diff, "
+                "and never use hedging phrases such as 'or adjusted logic', 'likely', or 'may have'.\n"
                 "2. STRUCTURE: Return a concise PR title and markdown body with sections "
                 "'## Summary', '## Changes', and '## Verification'.\n"
                 "3. ISSUE LINKING: If an Issue Closing Keyword (e.g., 'Closes #1') is provided, include a "
@@ -96,9 +97,8 @@ def pr_creation_node(state: AgentState) -> dict:
         ),
         (
             "human",
-            "Task: {task}\n\n"
             "Issue Closing Keyword: {issue_keyword}\n\n"
-            "Modified Files: {files}\n\n"
+            "Staged Files (git diff --cached --name-status):\n{name_status}\n\n"
             "Git Diff:\n```diff\n{git_diff}\n```",
         ),
     ])
@@ -108,11 +108,22 @@ def pr_creation_node(state: AgentState) -> dict:
     try:
         new_branch = repo.create_head(branch_name)
         new_branch.checkout()
-        repo.index.add(modified_files)
+
+        # Stage all tracked edits AND newly created untracked files
+        repo.git.add("-A")
+        for ignored_pattern in ("__pycache__", "*.pyc", ".pytest_cache"):
+            try:
+                repo.git.reset("HEAD", "--", ignored_pattern)
+            except Exception:
+                pass
+
+        name_status = repo.git.diff("--cached", "--name-status").strip()
+        if not name_status:
+            raise RuntimeError("No staged changes found after `git add -A`.")
 
         staged_diff = repo.git.diff("--cached")
-        if len(staged_diff) > 8000:
-            staged_diff = staged_diff[:8000] + "\n... [diff truncated]"
+        if len(staged_diff) > 10000:
+            staged_diff = staged_diff[:10000] + "\n... [diff truncated]"
 
         issue_number = _extract_issue_number(state)
         issue_keyword = f"Closes #{issue_number}" if issue_number else "None"
@@ -122,10 +133,9 @@ def pr_creation_node(state: AgentState) -> dict:
         for attempt in range(2):
             try:
                 raw = chain.invoke({
-                    "task": state["task"],
                     "issue_keyword": issue_keyword,
-                    "files": ", ".join(modified_files),
-                    "git_diff": staged_diff or "(no diff content)",
+                    "name_status": name_status,
+                    "git_diff": staged_diff,
                     "format_instructions": parser.get_format_instructions(),
                 })
                 pr_details = PRDetails(**raw)
