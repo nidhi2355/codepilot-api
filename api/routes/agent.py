@@ -59,18 +59,29 @@ async def stream_agent_execution(
 
     workflow = create_agent_workflow()
     app = workflow.compile()
+    final_status = "completed"
+    pr_created = False
 
     try:
         async for output in app.astream(initial_state):
             for node_name, state_update in output.items():
                 logger.info(f"Completed node: {node_name}")
+                if isinstance(state_update, dict):
+                    if state_update.get("status") == "error":
+                        final_status = "error"
+                    elif state_update.get("status") == "pr_created":
+                        final_status = "pr_created"
+                        pr_created = True
                 payload = {
                     "node": node_name,
                     "state_update": state_update,
                 }
                 yield f"data: {json.dumps(payload)}\n\n"
 
-        yield f"data: {json.dumps({'node': 'end', 'status': 'completed'})}\n\n"
+        if not pr_created:
+            final_status = "error"
+
+        yield f"data: {json.dumps({'node': 'end', 'status': final_status})}\n\n"
 
     except Exception as e:
         logger.error(f"Streaming failed: {str(e)}")
