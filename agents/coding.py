@@ -1,6 +1,7 @@
 import ast
 import os
 import re
+import time
 import logging
 import subprocess
 from typing import List, Set
@@ -23,6 +24,10 @@ IGNORED_DIRS = {
     ".mypy_cache",
     ".ruff_cache",
 }
+
+MAX_FULL_FILES_CHARS = 11000
+MAX_SNIPPETS_CHARS = 2500
+MAX_ERRORS_CHARS = 1500
 
 
 class SearchReplaceBlock(BaseModel):
@@ -76,7 +81,7 @@ def _is_test_only_task(task: str) -> bool:
     )
 
 
-def _get_repo_files(repo_path: str, limit: int = 200) -> List[str]:
+def _get_repo_files(repo_path: str, limit: int = 150) -> List[str]:
     files: List[str] = []
     if not repo_path or not os.path.exists(repo_path):
         return files
@@ -90,23 +95,7 @@ def _get_repo_files(repo_path: str, limit: int = 200) -> List[str]:
     return sorted(files)
 
 
-def _extract_explicit_target_files(
-    repo_files: List[str], plan: List[str], task: str
-) -> Set[str]:
-    """Finds existing repository .py files explicitly named in the task or execution plan."""
-    explicit: Set[str] = set()
-    plan_and_task = "\n".join(plan) + "\n" + task
-    mentioned_py = set(re.findall(r"[\w./-]+\.py", plan_and_task))
-
-    for rel_path in repo_files:
-        base = os.path.basename(rel_path)
-        if rel_path in mentioned_py or base in mentioned_py:
-            explicit.add(rel_path)
-
-    return explicit
-
-
-def _collect_full_target_files(
+def _collect_prioritized_files(
     repo_path: str,
     repo_files: List[str],
     retrieved_chunks: list,
@@ -114,84 +103,60 @@ def _collect_full_target_files(
     task: str,
 ) -> dict[str, str]:
     """
-    Loads full contents of all explicitly mentioned files, retrieved files, locally
-    imported sibling modules, and matching test files directly from disk.
+    Loads full contents of directly relevant source files and their matching test file
+    within a strict character budget to stay safely under Groq's 8,000 TPM limit.
     """
-    target_paths: Set[str] = _extract_explicit_target_files(repo_files, plan, task)
-    plan_and_task = "\n".join(plan) + "\n" + task
+    ordered_candidates: List[str] = []
+    seen: Set[str] = set()
 
-    for chunk in retrieved_chunks:
+    def _add(rel_path: str):
+        if rel_path in repo_files and rel_path not in seen:
+            seen.add(rel_path)
+            ordered_candidates.append(rel_path)
+
+    # 1. Explicit .py paths mentioned in task or plan (e.g. src/shopcore/pricing.py)
+    plan_and_task = task + "\n" + "\n".join(plan)
+    mentioned_py = set(re.findall(r"[\w./-]+\.py", plan_and_task))
+    for rel_path in repo_files:
+        if rel_path in mentioned_py or os.path.basename(rel_path) in mentioned_py:
+            _add(rel_path)
+
+    # 2. Top retrieved chunks from vector search
+    for chunk in retrieved_chunks[:4]:
         fp = chunk.get("file_path", "").replace("\\", "/").lstrip("./")
-        if fp in repo_files:
-            target_paths.add(fp)
+        _add(fp)
 
-    # Match module stems referenced in task/plan (e.g., "pricing" -> src/shopcore/pricing.py)
-    tokens = set(re.findall(r"\b[a-zA-Z_][a-zA-Z0-9_]{2,}\b", plan_and_task))
-    for rel_path in repo_files:
-        base = os.path.basename(rel_path)
-        if base.endswith(".py") and base != "__init__.py":
-            stem = base[:-3]
-            if stem in tokens:
-                target_paths.add(rel_path)
-
-    # Read initial target files from disk
-    full_files: dict[str, str] = {}
-    for rel_path in sorted(target_paths):
-        full_path = os.path.join(repo_path, rel_path)
-        if os.path.isfile(full_path):
-            try:
-                with open(full_path, "r", encoding="utf-8") as f:
-                    full_files[rel_path] = f.read()
-            except Exception as e:
-                logger.warning(f"Failed to read full file {rel_path}: {e}")
-
-    # Follow local repo imports inside loaded files (e.g., `from shopcore.pricing import ...`)
-    imported_stems: Set[str] = set()
-    for content in full_files.values():
-        for mod_path in re.findall(r"^\s*(?:from|import)\s+([\w.]+)", content, re.MULTILINE):
-            for part in mod_path.split("."):
-                if len(part) > 2:
-                    imported_stems.add(part)
-
-    for rel_path in repo_files:
-        if rel_path in full_files or _is_test_file(rel_path):
-            continue
-        base = os.path.basename(rel_path)
-        if base.endswith(".py") and base[:-3] in imported_stems:
-            full_path = os.path.join(repo_path, rel_path)
-            if os.path.isfile(full_path):
-                try:
-                    with open(full_path, "r", encoding="utf-8") as f:
-                        full_files[rel_path] = f.read()
-                    target_paths.add(rel_path)
-                except Exception:
-                    pass
-
-    # Auto-discover matching existing test files (e.g. pricing.py -> tests/test_pricing.py)
-    stems: Set[str] = set()
-    for path in list(target_paths):
+    # 3. Matching test file for non-test candidate modules (e.g. pricing.py -> tests/test_pricing.py)
+    stems: List[str] = []
+    for path in list(ordered_candidates):
         base = os.path.basename(path)
-        if base.endswith(".py") and not base.startswith("test_") and base != "__init__.py":
-            stem = base[:-3]
-            stems.add(stem)
-            if "_" in stem:
-                stems.add(stem.split("_")[0])
+        if base.endswith(".py") and not _is_test_file(path) and base != "__init__.py":
+            stems.append(base[:-3])
 
-    for rel_path in repo_files:
-        if rel_path in full_files:
+    for stem in stems:
+        for rel_path in repo_files:
+            base = os.path.basename(rel_path)
+            if base in (f"test_{stem}.py", f"test_{stem}s.py", f"{stem}_test.py"):
+                _add(rel_path)
+
+    full_files: dict[str, str] = {}
+    total_chars = 0
+
+    for rel_path in ordered_candidates:
+        full_path = os.path.join(repo_path, rel_path)
+        if not os.path.isfile(full_path):
             continue
-        base = os.path.basename(rel_path)
-        if any(
-            base in (f"test_{stem}.py", f"test_{stem}s.py", f"{stem}_test.py")
-            for stem in stems
-        ):
-            full_path = os.path.join(repo_path, rel_path)
-            if os.path.isfile(full_path):
-                try:
-                    with open(full_path, "r", encoding="utf-8") as f:
-                        full_files[rel_path] = f.read()
-                except Exception:
-                    pass
+        try:
+            with open(full_path, "r", encoding="utf-8") as f:
+                content = f.read()
+        except Exception as e:
+            logger.warning(f"Failed to read full file {rel_path}: {e}")
+            continue
+
+        if total_chars + len(content) > MAX_FULL_FILES_CHARS and full_files:
+            continue
+        full_files[rel_path] = content
+        total_chars += len(content)
 
     return full_files
 
@@ -246,12 +211,30 @@ def _apply_search_replace(
     return content, errors
 
 
+def _invoke_with_rate_limit_retry(chain, payload: dict, max_429_retries: int = 3):
+    """Handles Groq 429 TPM rate limits by waiting the requested retry-after window."""
+    for attempt in range(max_429_retries + 1):
+        try:
+            return chain.invoke(payload)
+        except Exception as err:
+            msg = str(err)
+            is_rate_limit = "429" in msg or "rate_limit_exceeded" in msg
+            if not is_rate_limit or attempt >= max_429_retries:
+                raise
+            wait_match = re.search(r"try again in\s+([0-9.]+)s", msg, re.IGNORECASE)
+            wait_secs = min(float(wait_match.group(1)) + 1.0, 30.0) if wait_match else 12.0
+            logger.warning(
+                f"Groq TPM rate limit hit; waiting {wait_secs:.1f}s before retry ({attempt + 1}/{max_429_retries})..."
+            )
+            time.sleep(wait_secs)
+
+
 def coding_node(state: AgentState) -> dict:
     """
-    LangGraph node: Generates surgical search-and-replace patches, validates syntax,
-    AST symbol preservation, required target files, and test coverage in a single pass.
+    LangGraph node: Generates surgical search-and-replace patches within Groq's TPM budget,
+    validates syntax, AST symbol preservation, and test coverage, and writes to disk.
     """
-    logger.info("Coding Agent: Loading full target files and generating surgical edits...")
+    logger.info("Coding Agent: Loading target files and generating surgical edits...")
 
     base_llm = ChatGroq(
         model="openai/gpt-oss-120b",
@@ -267,16 +250,15 @@ def coding_node(state: AgentState) -> dict:
             (
                 "You are an expert autonomous software engineer.\n"
                 "Rules you MUST follow:\n"
-                "1. SURGICAL SEARCH-AND-REPLACE ONLY: For existing files shown under 'Complete Target Files From Disk', "
-                "output ONLY small `edits` blocks with exact `target_code` (copied character-for-character from the file) "
-                "and `replacement_code`. NEVER rewrite entire existing files and NEVER delete existing methods, functions, "
-                "attributes, or default values.\n"
-                "2. PLACE LOGIC IN THE RIGHT MODULE: Do not inline helper functions or constants into caller modules "
-                "when a dedicated module (e.g., `pricing.py`) is specified in the task or plan.\n"
-                "3. BRAND-NEW FILES ONLY: Leave `target_code` empty (\"\") ONLY when creating a new file that does not "
-                "exist in the Repository File Tree.\n"
-                "4. SOURCE + TESTS TOGETHER: Always modify BOTH the implementation file(s) AND the matching existing "
-                "test file (e.g., `tests/test_<module>.py`) in the same response.\n\n"
+                "1. SURGICAL SEARCH-AND-REPLACE ONLY: For existing files under 'Complete Target Files From Disk', "
+                "output ONLY small `edits` blocks with exact `target_code` (copied character-for-character) "
+                "and `replacement_code`. NEVER rewrite entire existing files and NEVER delete existing methods, "
+                "functions, attributes, or default values.\n"
+                "2. PLACE LOGIC IN THE RIGHT MODULE: Put module-level constants/functions in the target module "
+                "(e.g. `src/shopcore/pricing.py`) rather than inlining them into caller functions.\n"
+                "3. BRAND-NEW FILES ONLY: Leave `target_code` empty (\"\") ONLY when creating a new file not in the tree.\n"
+                "4. SOURCE + TESTS TOGETHER: Always modify BOTH the target implementation file(s) AND the matching "
+                "test file (e.g. `tests/test_<module>.py`) in the same response.\n\n"
                 "{format_instructions}"
             ),
         ),
@@ -295,10 +277,7 @@ def coding_node(state: AgentState) -> dict:
     file_tree_str = "\n".join(repo_files) if repo_files else "(no files found)"
 
     retrieved_chunks = state.get("retrieved_context", [])
-    explicit_targets = _extract_explicit_target_files(repo_files, state.get("plan", []), state["task"])
-    explicit_source_targets = {p for p in explicit_targets if not _is_test_file(p)}
-
-    full_files_map = _collect_full_target_files(
+    full_files_map = _collect_prioritized_files(
         repo_path, repo_files, retrieved_chunks, state.get("plan", []), state["task"]
     )
 
@@ -307,135 +286,107 @@ def coding_node(state: AgentState) -> dict:
         for path, content in full_files_map.items()
     ]) or "(none)"
 
-    snippets_str = "\n\n".join([
-        f"--- Snippet: {chunk.get('file_path')} ---\n{chunk.get('content')}"
-        for chunk in retrieved_chunks
-        if chunk.get("file_path", "").replace("\\", "/").lstrip("./") not in full_files_map
-    ]) or "(none)"
+    snippets_parts: list[str] = []
+    snippets_len = 0
+    for chunk in retrieved_chunks:
+        fp = chunk.get("file_path", "").replace("\\", "/").lstrip("./")
+        if fp in full_files_map:
+            continue
+        entry = f"--- Snippet: {fp} ---\n{chunk.get('content', '')}"
+        if snippets_len + len(entry) > MAX_SNIPPETS_CHARS:
+            continue
+        snippets_parts.append(entry)
+        snippets_len += len(entry)
+    snippets_str = "\n\n".join(snippets_parts) or "(none)"
 
-    local_errors = list(state.get("errors", [])[-3:])
+    recent_errors = "\n".join(state.get("errors", [])[-2:])
+    if len(recent_errors) > MAX_ERRORS_CHARS:
+        recent_errors = recent_errors[-MAX_ERRORS_CHARS:]
+
     require_source_edit = not _is_test_only_task(state["task"])
 
-    validated_outputs: dict[str, str] | None = None
-    last_validation_errors: list[str] = []
-
-    for attempt in range(3):
-        try:
-            result_dict = chain.invoke({
+    try:
+        result_dict = _invoke_with_rate_limit_retry(
+            chain,
+            {
                 "task": state["task"],
                 "file_tree": file_tree_str,
                 "plan": "\n".join(state.get("plan", [])),
                 "full_files": full_files_str,
                 "snippets": snippets_str,
-                "errors": "\n".join(local_errors),
+                "errors": recent_errors or "(none)",
                 "format_instructions": parser.get_format_instructions(),
-            })
-            candidate = CodingOutput(**result_dict)
+            },
+        )
+        candidate = CodingOutput(**result_dict)
 
-            if not candidate.modifications:
-                last_validation_errors = ["Returned empty modifications list; provide required file edits."]
-                local_errors.append(last_validation_errors[0])
-                continue
+        if not candidate.modifications:
+            return {
+                "modified_files": [],
+                "errors": ["Coding Error: Returned empty modifications list; provide required file edits."],
+            }
 
-            grouped_edits: dict[str, List[SearchReplaceBlock]] = {}
-            for mod in candidate.modifications:
-                norm_path = mod.file_path.replace("\\", "/").lstrip("./")
-                grouped_edits.setdefault(norm_path, []).extend(mod.edits)
+        grouped_edits: dict[str, List[SearchReplaceBlock]] = {}
+        for mod in candidate.modifications:
+            norm_path = mod.file_path.replace("\\", "/").lstrip("./")
+            grouped_edits.setdefault(norm_path, []).extend(mod.edits)
 
-            static_errors: list[str] = []
-            candidate_contents: dict[str, str] = {}
+        static_errors: list[str] = []
+        candidate_contents: dict[str, str] = {}
 
-            for norm_path, edits in grouped_edits.items():
-                full_path = os.path.join(repo_path, norm_path)
-                if os.path.exists(full_path):
-                    if norm_path not in full_files_map:
-                        with open(full_path, "r", encoding="utf-8") as f:
-                            full_files_map[norm_path] = f.read()
-                        full_files_str += f"\n\n=== Complete File: {norm_path} ===\n{full_files_map[norm_path]}"
-                        static_errors.append(
-                            f"Loaded '{norm_path}' into context; re-emit surgical edits using its exact lines."
-                        )
-                        continue
+        for norm_path, edits in grouped_edits.items():
+            full_path = os.path.join(repo_path, norm_path)
+            if os.path.exists(full_path):
+                if norm_path not in full_files_map:
+                    with open(full_path, "r", encoding="utf-8") as f:
+                        full_files_map[norm_path] = f.read()
 
-                    new_src, patch_errs = _apply_search_replace(
-                        norm_path, full_files_map[norm_path], edits
-                    )
-                    static_errors.extend(patch_errs)
-                    if not patch_errs:
-                        if norm_path.endswith(".py"):
-                            static_errors.extend(
-                                check_source_regressions(
-                                    norm_path, full_files_map[norm_path], new_src, state["task"]
-                                )
-                            )
-                        candidate_contents[norm_path] = new_src
-                else:
-                    new_src = "\n".join(b.replacement_code for b in edits)
+                new_src, patch_errs = _apply_search_replace(
+                    norm_path, full_files_map[norm_path], edits
+                )
+                static_errors.extend(patch_errs)
+                if not patch_errs:
                     if norm_path.endswith(".py"):
-                        try:
-                            ast.parse(new_src)
-                        except SyntaxError as syn_err:
-                            static_errors.append(
-                                f"SyntaxError in new file '{norm_path}' at line {syn_err.lineno}: {syn_err.msg}"
+                        static_errors.extend(
+                            check_source_regressions(
+                                norm_path, full_files_map[norm_path], new_src, state["task"]
                             )
+                        )
                     candidate_contents[norm_path] = new_src
+            else:
+                new_src = "\n".join(b.replacement_code for b in edits)
+                if norm_path.endswith(".py"):
+                    try:
+                        ast.parse(new_src)
+                    except SyntaxError as syn_err:
+                        static_errors.append(
+                            f"SyntaxError in new file '{norm_path}' at line {syn_err.lineno}: {syn_err.msg}"
+                        )
+                candidate_contents[norm_path] = new_src
 
-            paths = list(grouped_edits.keys())
-            has_test = any(_is_test_file(p) for p in paths)
-            has_source = any(not _is_test_file(p) for p in paths)
+        paths = list(grouped_edits.keys())
+        has_test = any(_is_test_file(p) for p in paths)
+        has_source = any(not _is_test_file(p) for p in paths)
 
-            if require_source_edit and not has_source:
-                static_errors.append(
-                    "Missing source code changes: include edits to the target implementation file(s) alongside tests."
-                )
-
-            # Ensure explicitly referenced source modules (e.g. src/shopcore/pricing.py) were not bypassed
-            missing_explicit_sources = sorted(explicit_source_targets - set(paths))
-            if require_source_edit and missing_explicit_sources:
-                static_errors.append(
-                    "Bypassed required target module(s): "
-                    + ", ".join(missing_explicit_sources)
-                    + ". Put the module-level constants/functions in those files instead of inlining them."
-                )
-
-            if not has_test:
-                static_errors.append(
-                    "Missing unit tests: add or update tests in the matching existing test file (e.g., tests/test_<module>.py)."
-                )
-
-            if static_errors:
-                last_validation_errors = static_errors
-                combined_msg = "Attempt validation failed—fix ALL of the following together:\n" + "\n".join(
-                    f"- {err}" for err in static_errors
-                )
-                logger.warning(f"Coding static validation failed (internal attempt {attempt + 1}/3): {combined_msg}")
-                local_errors.append(combined_msg)
-                continue
-
-            validated_outputs = candidate_contents
-            break
-
-        except (ValidationError, ValueError, TypeError) as e:
-            last_validation_errors = [f"Schema validation error: {e}"]
-            logger.warning(f"CodingOutput validation failed on attempt {attempt + 1}/3: {e}")
-            local_errors.append(
-                f"JSON output failed schema validation: {e}. Return valid JSON with 'explanation' and 'modifications'."
+        if require_source_edit and not has_source:
+            static_errors.append(
+                "Missing source code changes: include edits to the target implementation file(s) alongside tests."
             )
-        except Exception as e:
-            logger.error(f"Coding failed: {str(e)}")
-            return {"modified_files": [], "errors": [f"Coding Error: {str(e)}"]}
+        if not has_test:
+            static_errors.append(
+                "Missing unit tests: add or update tests in the matching existing test file (e.g., tests/test_<module>.py)."
+            )
 
-    if not validated_outputs:
-        summary = "; ".join(last_validation_errors) or "Unable to produce valid code modifications."
-        logger.error(f"Coding failed after internal retries: {summary}")
-        return {"modified_files": [], "errors": [f"Coding Error: {summary}"]}
+        if static_errors:
+            combined_msg = "Coding validation failed:\n" + "\n".join(f"- {e}" for e in static_errors)
+            logger.warning(combined_msg)
+            return {"modified_files": [], "errors": [f"Coding Error: {combined_msg}"]}
 
-    try:
         if os.path.exists(os.path.join(repo_path, ".git")):
             subprocess.run(["git", "checkout", "--", "."], cwd=repo_path, capture_output=True)
 
         modified_files: list[str] = []
-        for norm_path, content in validated_outputs.items():
+        for norm_path, content in candidate_contents.items():
             full_path = os.path.join(repo_path, norm_path)
             os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
@@ -445,6 +396,9 @@ def coding_node(state: AgentState) -> dict:
 
         return {"modified_files": modified_files}
 
+    except (ValidationError, ValueError, TypeError) as e:
+        logger.warning(f"CodingOutput validation failed: {e}")
+        return {"modified_files": [], "errors": [f"Coding Error: Invalid JSON schema ({e})"]}
     except Exception as e:
-        logger.error(f"Writing modified files failed: {str(e)}")
+        logger.error(f"Coding failed: {str(e)}")
         return {"modified_files": [], "errors": [f"Coding Error: {str(e)}"]}
