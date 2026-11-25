@@ -3,6 +3,7 @@ import os
 import re
 import logging
 import subprocess
+import textwrap
 from typing import List, Set
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
@@ -35,7 +36,7 @@ class SearchReplaceBlock(BaseModel):
         description=(
             "Exact contiguous snippet from the existing file to replace. "
             "Must match character-for-character. Leave empty ONLY when creating a brand-new file "
-            "or appending new tests to an existing test file."
+            "or appending new functions/methods/tests at the end of a file."
         ),
     )
     replacement_code: str = Field(
@@ -103,8 +104,8 @@ def _collect_prioritized_files(
     task: str,
 ) -> dict[str, str]:
     """
-    Loads full contents of directly relevant source files AND their matching test files
-    with separate character budgets so test files are never crowded out.
+    Loads full contents of directly relevant source files, package __init__.py files,
+    and matching test files within separate character budgets.
     """
     ordered_candidates: List[str] = []
     seen: Set[str] = set()
@@ -123,6 +124,12 @@ def _collect_prioritized_files(
     for chunk in retrieved_chunks[:4]:
         fp = chunk.get("file_path", "").replace("\\", "/").lstrip("./")
         _add(fp)
+
+    # Include sibling __init__.py for any package module loaded (e.g. src/shopcore/__init__.py)
+    for path in list(ordered_candidates):
+        pkg_dir = os.path.dirname(path)
+        if pkg_dir and not _is_test_file(path):
+            _add(f"{pkg_dir}/__init__.py")
 
     stems: List[str] = []
     for path in list(ordered_candidates):
@@ -169,6 +176,69 @@ def _collect_prioritized_files(
     return full_files
 
 
+def _try_safe_python_append_or_update(
+    rel_path: str, content: str, replacement: str, task: str
+) -> str | None:
+    """
+    Safely resolves empty `target_code` on an existing .py file when `replacement` is:
+    1) A valid full-file update preserving all existing symbols/defaults,
+    2) A valid top-level function/class/constant appended at EOF, or
+    3) A valid indented method appended to the last class in the file.
+    """
+    rep_clean = replacement.rstrip()
+    if not rep_clean:
+        return None
+
+    # 1) Full-file update preserving existing symbols and line count
+    try:
+        ast.parse(rep_clean)
+        if (
+            len(rep_clean.splitlines()) >= max(1, int(len(content.splitlines()) * 0.85))
+            and not check_source_regressions(rel_path, content, rep_clean, task)
+        ):
+            return rep_clean + "\n"
+    except SyntaxError:
+        pass
+
+    # 2) Top-level append at EOF (column 0)
+    if not replacement.startswith((" ", "\t")):
+        try:
+            ast.parse(rep_clean)
+            candidate = content.rstrip() + "\n\n\n" + rep_clean + "\n"
+            ast.parse(candidate)
+            if not check_source_regressions(rel_path, content, candidate, task):
+                return candidate
+        except SyntaxError:
+            pass
+
+    # 3) Indented method append into the last class definition in the file
+    dedented = textwrap.dedent(rep_clean)
+    try:
+        mod_ast = ast.parse(dedented)
+        if mod_ast.body and all(
+            isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef)) for n in mod_ast.body
+        ):
+            src_tree = ast.parse(content)
+            classes = [n for n in src_tree.body if isinstance(n, ast.ClassDef)]
+            if classes:
+                last_cls = classes[-1]
+                insert_at = getattr(last_cls, "end_lineno", None)
+                if insert_at is not None:
+                    indented_method = textwrap.indent(dedented, "    ")
+                    lines = content.splitlines()
+                    updated_lines = (
+                        lines[:insert_at] + ["", indented_method] + lines[insert_at:]
+                    )
+                    candidate = "\n".join(updated_lines).rstrip() + "\n"
+                    ast.parse(candidate)
+                    if not check_source_regressions(rel_path, content, candidate, task):
+                        return candidate
+    except SyntaxError:
+        pass
+
+    return None
+
+
 def _apply_search_replace(
     rel_path: str, original_content: str, edits: List[SearchReplaceBlock], task: str
 ) -> tuple[str, list[str]]:
@@ -181,25 +251,38 @@ def _apply_search_replace(
         replacement = block.replacement_code
 
         if not target.strip():
-            # Empty existing file on disk (e.g. an empty test stub) -> safe to populate directly
+            # Empty existing file on disk (e.g. empty __init__.py or test stub)
             if not content.strip():
                 content = replacement.rstrip() + "\n"
                 continue
 
-            # Existing test file with empty target_code -> treat as full update if it keeps all existing tests,
-            # otherwise append new test code cleanly to the end of the file
+            # Existing test file -> full replacement if non-regressive, else append
             if _is_test_file(rel_path):
                 if rel_path.endswith(".py"):
-                    regressions = check_source_regressions(rel_path, content, replacement, task)
-                    if not regressions and "def test_" in replacement:
-                        content = replacement.rstrip() + "\n"
-                        continue
+                    try:
+                        ast.parse(replacement)
+                        regressions = check_source_regressions(rel_path, content, replacement, task)
+                        if not regressions and "def test_" in replacement:
+                            content = replacement.rstrip() + "\n"
+                            continue
+                    except SyntaxError:
+                        pass
                 content = content.rstrip() + "\n\n\n" + replacement.lstrip().rstrip() + "\n"
                 continue
 
+            # Existing Python source file -> safe append or full-file contract-verified update
+            if rel_path.endswith(".py"):
+                safe_updated = _try_safe_python_append_or_update(
+                    rel_path, content, replacement, task
+                )
+                if safe_updated is not None:
+                    content = safe_updated
+                    continue
+
+            eof_preview = "\n".join(content.splitlines()[-5:])
             errors.append(
-                f"Edit #{idx} for existing source file '{rel_path}' had an empty 'target_code'. "
-                "Provide the exact existing snippet to replace rather than rewriting the whole file."
+                f"Edit #{idx} in '{rel_path}' had empty 'target_code' and could not be auto-appended. "
+                f"Copy exact lines from '{rel_path}' (e.g. EOF lines:\n{eof_preview}\n) into 'target_code'."
             )
             continue
 
@@ -251,9 +334,9 @@ def coding_node(state: AgentState) -> dict:
                 "1. SURGICAL SEARCH-AND-REPLACE ONLY: For existing files under 'Complete Target Files From Disk', "
                 "output small `edits` blocks with exact `target_code` (copied character-for-character) "
                 "and `replacement_code`. NEVER delete existing methods, functions, attributes, or default values.\n"
-                "2. EDITING TEST FILES: To add new unit tests to an existing `tests/test_<module>.py` file, either "
-                "copy the last few lines of that test file as `target_code` and include them plus your new tests in "
-                "`replacement_code`, or leave `target_code` empty (\"\") to append new test functions.\n"
+                "2. ADDING NEW METHODS OR TESTS: To add a new method/function at the end of an existing file, "
+                "copy the last 3–5 lines of that file as `target_code` and include them followed by your new code in "
+                "`replacement_code`.\n"
                 "3. PLACE LOGIC IN THE RIGHT MODULE: Put module-level constants/functions in the target module "
                 "(e.g. `src/shopcore/pricing.py`) rather than inlining them into caller functions.\n"
                 "4. SOURCE + TESTS TOGETHER: Always modify BOTH the target implementation file(s) AND the matching "
@@ -375,9 +458,9 @@ def coding_node(state: AgentState) -> dict:
             )
 
         if static_errors:
-            combined_msg = "Coding validation failed:\n" + "\n".join(f"- {e}" for e in static_errors)
-            logger.warning(combined_msg)
-            return {"modified_files": [], "errors": [f"Coding Error: {combined_msg}"]}
+            combined_msg = "\n".join(static_errors)
+            logger.warning(f"Coding validation failed:\n{combined_msg}")
+            return {"modified_files": [], "errors": [f"Coding Error:\n{combined_msg}"]}
 
         if os.path.exists(os.path.join(repo_path, ".git")):
             subprocess.run(["git", "checkout", "--", "."], cwd=repo_path, capture_output=True)

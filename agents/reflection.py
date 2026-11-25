@@ -14,10 +14,30 @@ class ReflectionOutput(BaseModel):
     )
 
 
+def _summarize_coding_guidance(retry_num: int, latest_err: str) -> str:
+    """Produces a non-repetitive, actionable retry hint for pre-test coding validation errors."""
+    hints: list[str] = []
+    if "SyntaxError" in latest_err:
+        hints.append("fix the Python SyntaxError and check indentation/colons")
+    if "Missing unit tests" in latest_err:
+        hints.append("add unit tests in tests/test_<module>.py alongside your source edits")
+    if "Missing source code" in latest_err:
+        hints.append("include implementation edits in src/ alongside your unit tests")
+    if "target_code" in latest_err or "did not match" in latest_err:
+        hints.append("copy exact lines from Complete Target Files From Disk into target_code")
+    if "Deleted " in latest_err or "Changed default value" in latest_err:
+        hints.append("preserve all existing methods, functions, and default parameter values")
+
+    if not hints:
+        hints.append("address the coding validation issue above and regenerate valid edits")
+
+    return f"Retry {retry_num} Guidance: {', '.join(hints).capitalize()}."
+
+
 def reflection_node(state: AgentState) -> dict:
     """
     LangGraph node: Diagnoses coding/test/diff failures and returns ONLY the new
-    feedback item so LangGraph's operator.add reducer appends it once.
+    guidance item so LangGraph's operator.add reducer appends it once without duplication.
     """
     logger.info("Reflection Agent: Reviewing execution and diff integrity...")
 
@@ -26,38 +46,33 @@ def reflection_node(state: AgentState) -> dict:
     output = test_results.get("output", "")
     retry_count = state.get("retry_count", 0)
     modified_files = state.get("modified_files", [])
+    next_retry = retry_count + 1
 
     if not modified_files:
         latest_err = (state.get("errors") or ["Coding produced no valid file modifications."])[-1]
-        new_feedback = f"Retry {retry_count + 1} Feedback: {latest_err}"
-        return {"retry_count": retry_count + 1, "errors": [new_feedback]}
+        return {
+            "retry_count": next_retry,
+            "errors": [_summarize_coding_guidance(next_retry, latest_err)],
+        }
 
     if passed:
         violations = audit_diff_regressions(
             state.get("repo_path", "."), modified_files, state.get("task", "")
         )
         if violations:
-            violation_lines = "\n".join(f"- {v}" for v in violations)
+            violation_lines = "; ".join(violations)
             feedback = (
-                "Pytest passed, but the diff audit detected unintended deletions or altered defaults:\n"
-                f"{violation_lines}\n"
-                "Restore these exact attributes, default values, and functions while keeping your new changes."
+                f"Retry {next_retry} Guidance: Pytest passed, but diff audit flagged regressions "
+                f"({violation_lines}). Restore those exact symbols/defaults while keeping your changes."
             )
-            return {
-                "retry_count": retry_count + 1,
-                "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
-            }
+            return {"retry_count": next_retry, "errors": [feedback]}
 
         source_files = ", ".join(modified_files)
         feedback = (
-            f"Tests passed, but no test files were modified alongside {source_files}. "
-            "Add unit tests covering your changes in the matching existing test file "
-            "(e.g., `tests/test_<module>.py`)."
+            f"Retry {next_retry} Guidance: Tests passed, but no test files were modified alongside "
+            f"{source_files}. Add unit tests in tests/test_<module>.py."
         )
-        return {
-            "retry_count": retry_count + 1,
-            "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
-        }
+        return {"retry_count": next_retry, "errors": [feedback]}
 
     prompt = ChatPromptTemplate.from_messages([
         (
@@ -85,12 +100,12 @@ def reflection_node(state: AgentState) -> dict:
             temperature=0.1,
         )
         return {
-            "retry_count": retry_count + 1,
-            "errors": [f"Retry {retry_count + 1} Feedback: {result_obj.feedback}"],
+            "retry_count": next_retry,
+            "errors": [f"Retry {next_retry} Diagnosis: {result_obj.feedback}"],
         }
     except Exception as e:
         logger.error(f"Reflection failed: {str(e)}")
         return {
-            "retry_count": retry_count + 1,
+            "retry_count": next_retry,
             "errors": [f"Reflection Error: {str(e)}"],
         }
