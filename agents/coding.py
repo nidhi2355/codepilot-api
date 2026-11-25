@@ -96,6 +96,25 @@ def _get_repo_files(repo_path: str, limit: int = 150) -> List[str]:
     return sorted(files)
 
 
+def _get_existing_dirty_sources(repo_path: str) -> list[str]:
+    """Returns non-test tracked files currently modified on disk from a prior verified pass."""
+    if not os.path.exists(os.path.join(repo_path, ".git")):
+        return []
+    proc = subprocess.run(
+        ["git", "diff", "--name-only"],
+        cwd=repo_path,
+        capture_output=True,
+        text=True,
+    )
+    if proc.returncode != 0:
+        return []
+    return [
+        line.strip().replace("\\", "/")
+        for line in proc.stdout.splitlines()
+        if line.strip() and not _is_test_file(line.strip())
+    ]
+
+
 def _collect_prioritized_files(
     repo_path: str,
     repo_files: List[str],
@@ -125,7 +144,6 @@ def _collect_prioritized_files(
         fp = chunk.get("file_path", "").replace("\\", "/").lstrip("./")
         _add(fp)
 
-    # Include sibling __init__.py for any package module loaded (e.g. src/shopcore/__init__.py)
     for path in list(ordered_candidates):
         pkg_dir = os.path.dirname(path)
         if pkg_dir and not _is_test_file(path):
@@ -179,17 +197,10 @@ def _collect_prioritized_files(
 def _try_safe_python_append_or_update(
     rel_path: str, content: str, replacement: str, task: str
 ) -> str | None:
-    """
-    Safely resolves empty `target_code` on an existing .py file when `replacement` is:
-    1) A valid full-file update preserving all existing symbols/defaults,
-    2) A valid top-level function/class/constant appended at EOF, or
-    3) A valid indented method appended to the last class in the file.
-    """
     rep_clean = replacement.rstrip()
     if not rep_clean:
         return None
 
-    # 1) Full-file update preserving existing symbols and line count
     try:
         ast.parse(rep_clean)
         if (
@@ -200,7 +211,6 @@ def _try_safe_python_append_or_update(
     except SyntaxError:
         pass
 
-    # 2) Top-level append at EOF (column 0)
     if not replacement.startswith((" ", "\t")):
         try:
             ast.parse(rep_clean)
@@ -211,7 +221,6 @@ def _try_safe_python_append_or_update(
         except SyntaxError:
             pass
 
-    # 3) Indented method append into the last class definition in the file
     dedented = textwrap.dedent(rep_clean)
     try:
         mod_ast = ast.parse(dedented)
@@ -242,7 +251,6 @@ def _try_safe_python_append_or_update(
 def _apply_search_replace(
     rel_path: str, original_content: str, edits: List[SearchReplaceBlock], task: str
 ) -> tuple[str, list[str]]:
-    """Applies search-and-replace blocks in memory and returns (new_content, errors)."""
     content = original_content
     errors: list[str] = []
 
@@ -251,12 +259,10 @@ def _apply_search_replace(
         replacement = block.replacement_code
 
         if not target.strip():
-            # Empty existing file on disk (e.g. empty __init__.py or test stub)
             if not content.strip():
                 content = replacement.rstrip() + "\n"
                 continue
 
-            # Existing test file -> full replacement if non-regressive, else append
             if _is_test_file(rel_path):
                 if rel_path.endswith(".py"):
                     try:
@@ -270,7 +276,6 @@ def _apply_search_replace(
                 content = content.rstrip() + "\n\n\n" + replacement.lstrip().rstrip() + "\n"
                 continue
 
-            # Existing Python source file -> safe append or full-file contract-verified update
             if rel_path.endswith(".py"):
                 safe_updated = _try_safe_python_append_or_update(
                     rel_path, content, replacement, task
@@ -318,12 +323,100 @@ def _apply_search_replace(
     return content, errors
 
 
+def _generate_followup_tests(
+    repo_path: str,
+    task: str,
+    updated_sources: dict[str, str],
+    existing_tests: dict[str, str],
+) -> dict[str, str]:
+    """
+    Focused follow-up pass when source edits are valid on disk but unit tests were omitted.
+    """
+    test_prompt = ChatPromptTemplate.from_messages([
+        (
+            "system",
+            (
+                "You are an expert Python test engineer.\n"
+                "Write unit tests covering the task using `pytest`.\n"
+                "Rules:\n"
+                "1. Output modifications ONLY for the target test file(s) listed below.\n"
+                "2. Leave `target_code` empty (\"\") to append your new `def test_...` functions cleanly.\n"
+                "3. Do NOT delete any existing tests.\n\n"
+                "{format_instructions}"
+            ),
+        ),
+        (
+            "human",
+            "Task:\n{task}\n\nUpdated Implementation Files:\n{sources}\n\nTarget Test Files:\n{tests}",
+        ),
+    ])
+
+    sources_str = "\n\n".join(
+        f"=== {p} ===\n{c}" for p, c in updated_sources.items()
+    )
+    tests_str = "\n\n".join(
+        f"=== {p} ===\n{c if c.strip() else '(empty file)'}" for p, c in existing_tests.items()
+    )
+
+    test_out = invoke_structured_groq(
+        prompt=test_prompt,
+        payload={"task": task, "sources": sources_str, "tests": tests_str},
+        schema=CodingOutput,
+        temperature=0.1,
+    )
+
+    written_tests: dict[str, str] = {}
+    for mod in test_out.modifications:
+        norm_path = mod.file_path.replace("\\", "/").lstrip("./")
+        if not _is_test_file(norm_path):
+            continue
+        full_path = os.path.join(repo_path, norm_path)
+        orig = existing_tests.get(norm_path, "")
+        if not orig and os.path.isfile(full_path):
+            with open(full_path, "r", encoding="utf-8") as f:
+                orig = f.read()
+
+        if os.path.exists(full_path):
+            new_src, errs = _apply_search_replace(norm_path, orig, mod.edits, task)
+            if errs:
+                continue
+        else:
+            new_src = "\n".join(b.replacement_code for b in mod.edits)
+
+        try:
+            ast.parse(new_src)
+        except SyntaxError:
+            continue
+
+        os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+        with open(full_path, "w", encoding="utf-8") as f:
+            f.write(new_src)
+        written_tests[norm_path] = new_src
+
+    return written_tests
+
+
 def coding_node(state: AgentState) -> dict:
     """
     LangGraph node: Generates surgical search-and-replace patches with multi-model TPD
-    failover, validates syntax, AST symbol preservation, and test coverage, and writes to disk.
+    failover, preserves verified source edits, auto-completes missing unit tests, and writes to disk.
     """
     logger.info("Coding Agent: Loading target files and generating surgical edits...")
+
+    repo_path = state.get("repo_path", ".")
+    repo_files = _get_repo_files(repo_path)
+    file_tree_str = "\n".join(repo_files) if repo_files else "(no files found)"
+
+    retrieved_chunks = state.get("retrieved_context", [])
+    full_files_map = _collect_prioritized_files(
+        repo_path, repo_files, retrieved_chunks, state.get("plan", []), state["task"]
+    )
+    discovered_test_files = sorted(p for p in full_files_map if _is_test_file(p))
+    test_targets_hint = (
+        ", ".join(discovered_test_files)
+        if discovered_test_files
+        else "tests/test_<module>.py"
+    )
 
     prompt = ChatPromptTemplate.from_messages([
         (
@@ -336,11 +429,11 @@ def coding_node(state: AgentState) -> dict:
                 "and `replacement_code`. NEVER delete existing methods, functions, attributes, or default values.\n"
                 "2. ADDING NEW METHODS OR TESTS: To add a new method/function at the end of an existing file, "
                 "copy the last 3–5 lines of that file as `target_code` and include them followed by your new code in "
-                "`replacement_code`.\n"
+                "`replacement_code` (for test files, leaving `target_code` empty appends tests cleanly).\n"
                 "3. PLACE LOGIC IN THE RIGHT MODULE: Put module-level constants/functions in the target module "
                 "(e.g. `src/shopcore/pricing.py`) rather than inlining them into caller functions.\n"
                 "4. SOURCE + TESTS TOGETHER: Always modify BOTH the target implementation file(s) AND the matching "
-                "test file (e.g. `tests/test_<module>.py`) in the same response.\n\n"
+                f"test file ({test_targets_hint}) in the same response.\n\n"
                 "{format_instructions}"
             ),
         ),
@@ -351,15 +444,6 @@ def coding_node(state: AgentState) -> dict:
             "Additional Reference Snippets:\n{snippets}\n\nPrevious Errors/Feedback:\n{errors}",
         ),
     ])
-
-    repo_path = state.get("repo_path", ".")
-    repo_files = _get_repo_files(repo_path)
-    file_tree_str = "\n".join(repo_files) if repo_files else "(no files found)"
-
-    retrieved_chunks = state.get("retrieved_context", [])
-    full_files_map = _collect_prioritized_files(
-        repo_path, repo_files, retrieved_chunks, state.get("plan", []), state["task"]
-    )
 
     full_files_str = "\n\n".join([
         f"=== Complete File: {path} ===\n{content if content.strip() else '(empty file)'}"
@@ -384,6 +468,7 @@ def coding_node(state: AgentState) -> dict:
         recent_errors = recent_errors[-MAX_ERRORS_CHARS:]
 
     require_source_edit = not _is_test_only_task(state["task"])
+    already_dirty_sources = _get_existing_dirty_sources(repo_path)
 
     try:
         candidate = invoke_structured_groq(
@@ -402,7 +487,7 @@ def coding_node(state: AgentState) -> dict:
 
         if not candidate.modifications:
             return {
-                "modified_files": [],
+                "modified_files": already_dirty_sources,
                 "errors": ["Coding Error: Returned empty modifications list; provide required file edits."],
             }
 
@@ -417,19 +502,22 @@ def coding_node(state: AgentState) -> dict:
         for norm_path, edits in grouped_edits.items():
             full_path = os.path.join(repo_path, norm_path)
             if os.path.exists(full_path):
-                if norm_path not in full_files_map:
+                # Read clean HEAD version for tracked files so patches apply against a known baseline
+                base_content = full_files_map.get(norm_path)
+                if base_content is None:
                     with open(full_path, "r", encoding="utf-8") as f:
-                        full_files_map[norm_path] = f.read()
+                        base_content = f.read()
+                    full_files_map[norm_path] = base_content
 
                 new_src, patch_errs = _apply_search_replace(
-                    norm_path, full_files_map[norm_path], edits, state["task"]
+                    norm_path, base_content, edits, state["task"]
                 )
                 static_errors.extend(patch_errs)
                 if not patch_errs:
                     if norm_path.endswith(".py"):
                         static_errors.extend(
                             check_source_regressions(
-                                norm_path, full_files_map[norm_path], new_src, state["task"]
+                                norm_path, base_content, new_src, state["task"]
                             )
                         )
                     candidate_contents[norm_path] = new_src
@@ -446,36 +534,90 @@ def coding_node(state: AgentState) -> dict:
 
         paths = list(grouped_edits.keys())
         has_test = any(_is_test_file(p) for p in paths)
-        has_source = any(not _is_test_file(p) for p in paths)
+        has_source = any(not _is_test_file(p) for p in paths) or bool(already_dirty_sources)
 
         if require_source_edit and not has_source:
             static_errors.append(
                 "Missing source code changes: include edits to the target implementation file(s) alongside tests."
             )
+
+        # If source edits are valid and ONLY tests were omitted, write source edits and run a focused test pass
+        if not static_errors and not has_test and candidate_contents:
+            written_files = list(already_dirty_sources)
+            for norm_path, content in candidate_contents.items():
+                full_path = os.path.join(repo_path, norm_path)
+                os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
+                with open(full_path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                if norm_path not in written_files:
+                    written_files.append(norm_path)
+
+            existing_tests_map = {
+                p: full_files_map[p] for p in discovered_test_files if p in full_files_map
+            }
+            if not existing_tests_map:
+                # Fallback target test path derived from primary edited source module
+                primary_src = next((p for p in candidate_contents if not _is_test_file(p)), "module.py")
+                stem = os.path.basename(primary_src)[:-3]
+                existing_tests_map[f"tests/test_{stem}.py"] = ""
+
+            try:
+                written_tests = _generate_followup_tests(
+                    repo_path,
+                    state["task"],
+                    {p: c for p, c in candidate_contents.items() if not _is_test_file(p)},
+                    existing_tests_map,
+                )
+                for tp in written_tests:
+                    if tp not in written_files:
+                        written_files.append(tp)
+                if written_tests:
+                    return {"modified_files": written_files}
+            except Exception as test_gen_err:
+                logger.warning(f"Focused follow-up test generation failed: {test_gen_err}")
+
+            return {
+                "modified_files": written_files,
+                "errors": [
+                    f"Coding Error:\nMissing unit tests: add or update tests in {test_targets_hint}."
+                ],
+            }
+
         if not has_test:
             static_errors.append(
-                "Missing unit tests: add or update tests in the matching existing test file (e.g., tests/test_<module>.py)."
+                f"Missing unit tests: add or update tests in {test_targets_hint}."
             )
 
         if static_errors:
             combined_msg = "\n".join(static_errors)
             logger.warning(f"Coding validation failed:\n{combined_msg}")
-            return {"modified_files": [], "errors": [f"Coding Error:\n{combined_msg}"]}
+            return {
+                "modified_files": already_dirty_sources,
+                "errors": [f"Coding Error:\n{combined_msg}"],
+            }
 
+        # Reset only files being freshly overwritten so prior verified source edits remain intact
         if os.path.exists(os.path.join(repo_path, ".git")):
-            subprocess.run(["git", "checkout", "--", "."], cwd=repo_path, capture_output=True)
+            for norm_path in candidate_contents:
+                if os.path.exists(os.path.join(repo_path, norm_path)):
+                    subprocess.run(
+                        ["git", "checkout", "--", norm_path],
+                        cwd=repo_path,
+                        capture_output=True,
+                    )
 
-        modified_files: list[str] = []
+        modified_files: list[str] = list(already_dirty_sources)
         for norm_path, content in candidate_contents.items():
             full_path = os.path.join(repo_path, norm_path)
             os.makedirs(os.path.dirname(full_path) or ".", exist_ok=True)
             with open(full_path, "w", encoding="utf-8") as f:
                 f.write(content)
-            modified_files.append(norm_path)
+            if norm_path not in modified_files:
+                modified_files.append(norm_path)
             logger.info(f"Successfully wrote verified edits to: {full_path}")
 
         return {"modified_files": modified_files}
 
     except Exception as e:
         logger.error(f"Coding failed: {str(e)}")
-        return {"modified_files": [], "errors": [f"Coding Error: {str(e)}"]}
+        return {"modified_files": already_dirty_sources, "errors": [f"Coding Error: {str(e)}"]}

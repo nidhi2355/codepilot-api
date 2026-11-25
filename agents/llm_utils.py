@@ -3,6 +3,7 @@ import re
 import time
 import logging
 from typing import Type, TypeVar
+import httpx
 from pydantic import BaseModel, ValidationError
 from langchain_core.prompts import ChatPromptTemplate
 from langchain_groq import ChatGroq
@@ -12,22 +13,73 @@ logger = logging.getLogger(__name__)
 
 T = TypeVar("T", bound=BaseModel)
 
+# Active Groq self-serve / free-tier text models (Nov 2026)
 DEFAULT_GROQ_MODELS = [
     "openai/gpt-oss-120b",
-    "llama-3.3-70b-versatile",
-    "meta-llama/llama-4-scout-17b-16e-instruct",
-    "qwen/qwen3-32b",
-    "llama-3.1-8b-instant",
+    "openai/gpt-oss-20b",
+    "qwen/qwen3.8-27b",
 ]
 
+NON_CHAT_PREFIXES = (
+    "whisper-",
+    "canopylabs/",
+    "meta-llama/llama-prompt-guard",
+    "openai/gpt-oss-safeguard",
+)
 
-def _get_model_candidates() -> list[str]:
+_AVAILABLE_MODELS_CACHE: tuple[float, set[str]] | None = None
+_CACHE_TTL_SECONDS = 600.0
+
+
+def _fetch_account_models(api_key: str) -> set[str]:
+    """Queries Groq's /openai/v1/models endpoint to discover models enabled for this API key."""
+    global _AVAILABLE_MODELS_CACHE
+    now = time.time()
+    if _AVAILABLE_MODELS_CACHE and (now - _AVAILABLE_MODELS_CACHE[0]) < _CACHE_TTL_SECONDS:
+        return _AVAILABLE_MODELS_CACHE[1]
+
+    try:
+        res = httpx.get(
+            "https://api.groq.com/openai/v1/models",
+            headers={"Authorization": f"Bearer {api_key}"},
+            timeout=10.0,
+        )
+        if res.status_code == 200:
+            data = res.json().get("data", [])
+            ids = {
+                m["id"]
+                for m in data
+                if isinstance(m, dict)
+                and m.get("id")
+                and m.get("active", True)
+                and not m["id"].startswith(NON_CHAT_PREFIXES)
+            }
+            if ids:
+                _AVAILABLE_MODELS_CACHE = (now, ids)
+                return ids
+    except Exception as e:
+        logger.debug(f"Could not fetch live Groq model list: {e}")
+
+    return set()
+
+
+def _get_model_candidates(api_key: str) -> list[str]:
     primary = os.getenv("GROQ_MODEL", "").strip()
-    models = [primary] if primary else []
+    ordered = [primary] if primary else []
     for m in DEFAULT_GROQ_MODELS:
-        if m not in models:
-            models.append(m)
-    return models
+        if m not in ordered:
+            ordered.append(m)
+
+    available = _fetch_account_models(api_key)
+    if not available:
+        return ordered
+
+    filtered = [m for m in ordered if m in available]
+    for m in sorted(available):
+        if m not in filtered:
+            filtered.append(m)
+
+    return filtered or ordered
 
 
 def invoke_structured_groq(
@@ -39,18 +91,21 @@ def invoke_structured_groq(
 ) -> T:
     """
     Invokes ChatGroq with structured JSON parsing, short TPM backoff, and automatic
-    failover across Groq models when a model's daily token quota (TPD) is exhausted.
+    failover across active Groq self-serve models when a model's TPD quota is exhausted.
     """
-    api_key = os.getenv("GROQ_API_KEY")
+    api_key = os.getenv("GROQ_API_KEY", "").strip()
+    if not api_key:
+        raise RuntimeError("GROQ_API_KEY environment variable is not set")
+
     parser = JsonOutputParser(pydantic_object=schema)
     full_payload = {
         **payload,
         "format_instructions": parser.get_format_instructions(),
     }
 
-    last_error: Exception | None = None
+    model_errors: list[str] = []
 
-    for model_name in _get_model_candidates():
+    for model_name in _get_model_candidates(api_key):
         base_llm = ChatGroq(
             model=model_name,
             api_key=api_key,
@@ -67,14 +122,13 @@ def invoke_structured_groq(
                 return schema(**raw)
 
             except (ValidationError, ValueError, TypeError) as val_err:
-                last_error = val_err
+                model_errors.append(f"{model_name}: invalid JSON schema ({val_err})")
                 json_attempt += 1
                 logger.warning(
                     f"[{model_name}] JSON schema validation failed ({json_attempt}/{max_json_retries}): {val_err}"
                 )
 
             except Exception as err:
-                last_error = err
                 msg = str(err)
                 msg_lower = msg.lower()
 
@@ -89,7 +143,13 @@ def invoke_structured_groq(
                 )
                 is_model_unavailable = any(
                     k in msg_lower
-                    for k in ("model_not_found", "model_decommissioned", "does not exist", "tool_use_failed")
+                    for k in (
+                        "model_not_found",
+                        "model_decommissioned",
+                        "does not exist",
+                        "do not have access",
+                        "tool_use_failed",
+                    )
                 )
 
                 if is_429 and not is_tpd and tpm_retries < 2:
@@ -102,11 +162,12 @@ def invoke_structured_groq(
                     continue
 
                 if is_429 or is_model_unavailable:
-                    logger.warning(
-                        f"[{model_name}] Quota/availability limit reached; failing over to next Groq model..."
-                    )
+                    reason = "daily TPD limit reached" if is_tpd else "unavailable/rate-limited"
+                    model_errors.append(f"{model_name}: {reason}")
+                    logger.warning(f"[{model_name}] {reason}; failing over to next Groq model...")
                     break
 
                 raise
 
-    raise RuntimeError(f"All Groq models exhausted or failed: {last_error}")
+    summary = "; ".join(dict.fromkeys(model_errors)) or "No Groq models succeeded"
+    raise RuntimeError(f"All Groq models exhausted or failed ({summary})")

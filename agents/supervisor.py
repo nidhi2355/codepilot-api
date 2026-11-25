@@ -12,7 +12,7 @@ from agents.reflection import reflection_node
 from agents.pr_creator import pr_creation_node
 
 logger = logging.getLogger(__name__)
-MAX_RETRIES = 3
+MAX_RETRIES = int(os.getenv("MAX_AGENT_RETRIES", "5"))
 
 
 def _is_test_file(path: str) -> bool:
