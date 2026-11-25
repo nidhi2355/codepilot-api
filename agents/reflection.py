@@ -1,10 +1,8 @@
-import os
 import logging
 from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
-from langchain_core.output_parsers import JsonOutputParser
 from agents.ast_guard import audit_diff_regressions
+from agents.llm_utils import invoke_structured_groq
 from agents.state import AgentState
 
 logger = logging.getLogger(__name__)
@@ -29,13 +27,11 @@ def reflection_node(state: AgentState) -> dict:
     retry_count = state.get("retry_count", 0)
     modified_files = state.get("modified_files", [])
 
-    # Case 1: Coding failed before running tests (empty modified_files)
     if not modified_files:
         latest_err = (state.get("errors") or ["Coding produced no valid file modifications."])[-1]
         new_feedback = f"Retry {retry_count + 1} Feedback: {latest_err}"
         return {"retry_count": retry_count + 1, "errors": [new_feedback]}
 
-    # Case 2: Pytest passed, but diff audit or test coverage gate rejected the patch
     if passed:
         violations = audit_diff_regressions(
             state.get("repo_path", "."), modified_files, state.get("task", "")
@@ -47,7 +43,6 @@ def reflection_node(state: AgentState) -> dict:
                 f"{violation_lines}\n"
                 "Restore these exact attributes, default values, and functions while keeping your new changes."
             )
-            logger.info(f"Reflection flagged diff regressions: {violations}")
             return {
                 "retry_count": retry_count + 1,
                 "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
@@ -64,15 +59,6 @@ def reflection_node(state: AgentState) -> dict:
             "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
         }
 
-    # Case 3: Pytest failed -> diagnose root cause without writing speculative code
-    base_llm = ChatGroq(
-        model="openai/gpt-oss-120b",
-        api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0.1,
-    )
-    llm = base_llm.bind(tool_choice="none")
-    parser = JsonOutputParser(pydantic_object=ReflectionOutput)
-
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
@@ -88,20 +74,19 @@ def reflection_node(state: AgentState) -> dict:
         ("human", "Task: {task}\n\nTest Output:\n{test_output}"),
     ])
 
-    chain = prompt | llm | parser
-
     try:
-        result_dict = chain.invoke({
-            "task": state["task"],
-            "test_output": output[-2000:],
-            "format_instructions": parser.get_format_instructions(),
-        })
-
-        feedback = result_dict.get("feedback", "No specific feedback generated.")
-        logger.info(f"Reflection complete. Feedback: {feedback}")
+        result_obj = invoke_structured_groq(
+            prompt=prompt,
+            payload={
+                "task": state["task"],
+                "test_output": output[-2000:],
+            },
+            schema=ReflectionOutput,
+            temperature=0.1,
+        )
         return {
             "retry_count": retry_count + 1,
-            "errors": [f"Retry {retry_count + 1} Feedback: {feedback}"],
+            "errors": [f"Retry {retry_count + 1} Feedback: {result_obj.feedback}"],
         }
     except Exception as e:
         logger.error(f"Reflection failed: {str(e)}")

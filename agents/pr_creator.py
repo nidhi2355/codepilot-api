@@ -5,11 +5,10 @@ import logging
 from typing import Optional
 import httpx
 from git import Repo, Actor
-from pydantic import BaseModel, Field, ValidationError
+from pydantic import BaseModel, Field
 from langchain_core.prompts import ChatPromptTemplate
-from langchain_groq import ChatGroq
-from langchain_core.output_parsers import JsonOutputParser
 from agents.state import AgentState
+from agents.llm_utils import invoke_structured_groq
 
 logger = logging.getLogger(__name__)
 
@@ -71,14 +70,6 @@ def pr_creation_node(state: AgentState) -> dict:
     base_branch = repo.active_branch.name
     branch_name = f"codepilot-fix-{uuid.uuid4().hex[:8]}"
 
-    base_llm = ChatGroq(
-        model="openai/gpt-oss-120b",
-        api_key=os.getenv("GROQ_API_KEY"),
-        temperature=0.0,
-    )
-    llm = base_llm.bind(tool_choice="none")
-    parser = JsonOutputParser(pydantic_object=PRDetails)
-
     prompt = ChatPromptTemplate.from_messages([
         (
             "system",
@@ -103,8 +94,6 @@ def pr_creation_node(state: AgentState) -> dict:
         ),
     ])
 
-    chain = prompt | llm | parser
-
     try:
         new_branch = repo.create_head(branch_name)
         new_branch.checkout()
@@ -128,24 +117,16 @@ def pr_creation_node(state: AgentState) -> dict:
         issue_number = _extract_issue_number(state)
         issue_keyword = f"Closes #{issue_number}" if issue_number else "None"
 
-        pr_details = None
-        last_llm_err = None
-        for attempt in range(2):
-            try:
-                raw = chain.invoke({
-                    "issue_keyword": issue_keyword,
-                    "name_status": name_status,
-                    "git_diff": staged_diff,
-                    "format_instructions": parser.get_format_instructions(),
-                })
-                pr_details = PRDetails(**raw)
-                break
-            except (ValidationError, ValueError, TypeError) as err:
-                last_llm_err = err
-                logger.warning(f"PRDetails parse attempt {attempt + 1} failed: {err}")
-
-        if pr_details is None:
-            raise RuntimeError(f"Failed to generate valid PR summary JSON: {last_llm_err}")
+        pr_details = invoke_structured_groq(
+            prompt=prompt,
+            payload={
+                "issue_keyword": issue_keyword,
+                "name_status": name_status,
+                "git_diff": staged_diff,
+            },
+            schema=PRDetails,
+            temperature=0.0,
+        )
 
         pr_body = pr_details.body.strip()
         if issue_number:
