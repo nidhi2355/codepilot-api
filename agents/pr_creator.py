@@ -1,5 +1,7 @@
+import base64
 import os
 import re
+import subprocess
 import uuid
 import logging
 from typing import Optional
@@ -45,6 +47,82 @@ def _extract_issue_number(state: AgentState) -> Optional[int]:
         if match:
             return int(match.group(1))
     return None
+
+
+def _verify_github_push_access(owner: str, repo_name: str, github_token: str) -> None:
+    """Validates the GitHub token, OAuth scopes, and push permission before running git push."""
+    res = httpx.get(
+        f"https://api.github.com/repos/{owner}/{repo_name}",
+        headers={
+            "Authorization": f"Bearer {github_token}",
+            "Accept": "application/vnd.github+json",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+        timeout=15.0,
+    )
+    if res.status_code == 401:
+        raise RuntimeError(
+            "GitHub rejected the stored OAuth token (401 Bad credentials). "
+            "Sign out of CodePilot and click 'Continue with GitHub' to refresh your session."
+        )
+    if res.status_code == 404:
+        raise RuntimeError(
+            f"GitHub could not access {owner}/{repo_name} (404). "
+            "If private, re-authorize with 'repo' OAuth scope or install the GitHub App on this repository."
+        )
+    if res.status_code >= 400:
+        raise RuntimeError(f"GitHub repo check failed ({res.status_code}): {res.text}")
+
+    oauth_scopes = res.headers.get("X-OAuth-Scopes")
+    if oauth_scopes is not None:
+        scopes = {s.strip() for s in oauth_scopes.split(",") if s.strip()}
+        if "repo" not in scopes and "public_repo" not in scopes:
+            raise RuntimeError(
+                f"GitHub OAuth token lacks 'repo' write scope (current scopes: {sorted(scopes) or 'none'}). "
+                "Revoke CodePilot in GitHub -> Settings -> Applications -> Authorized OAuth Apps, "
+                "then Sign out and sign in again."
+            )
+
+    permissions = res.json().get("permissions") or {}
+    if permissions and not permissions.get("push", False):
+        raise RuntimeError(
+            f"Authenticated GitHub user does not have write (push) permission on {owner}/{repo_name}."
+        )
+
+
+def _git_push_with_extraheader(
+    repo_path: str, branch_name: str, owner: str, repo_name: str, github_token: str
+) -> None:
+    """Pushes branch using an ephemeral HTTP Basic extraheader without modifying .git/config."""
+    clean_url = f"https://github.com/{owner}/{repo_name}.git"
+    basic_b64 = base64.b64encode(f"x-access-token:{github_token}".encode("utf-8")).decode("ascii")
+
+    env = os.environ.copy()
+    env["GIT_TERMINAL_PROMPT"] = "0"
+
+    proc = subprocess.run(
+        [
+            "git",
+            "-c",
+            f"http.https://github.com/.extraheader=AUTHORIZATION: basic {basic_b64}",
+            "push",
+            "--porcelain",
+            clean_url,
+            f"{branch_name}:{branch_name}",
+        ],
+        cwd=repo_path,
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=30,
+    )
+    if proc.returncode != 0:
+        err_msg = (proc.stderr or proc.stdout).strip()
+        raise RuntimeError(
+            f"Git push to {owner}/{repo_name} failed: {err_msg}. "
+            "If using a GitHub App, verify 'Contents: Read and write' and 'Pull requests: Read and write' "
+            "permissions are enabled and installed on this repository."
+        )
 
 
 def pr_creation_node(state: AgentState) -> dict:
@@ -95,6 +173,16 @@ def pr_creation_node(state: AgentState) -> dict:
     ])
 
     try:
+        github_token = (state.get("github_token") or os.getenv("GITHUB_TOKEN") or "").strip()
+        if not github_token:
+            raise RuntimeError(
+                "No GitHub access token found for this session. Sign out and sign in with GitHub again."
+            )
+
+        original_url = repo.remotes.origin.url
+        owner, repo_name = _parse_github_owner_repo(original_url)
+        _verify_github_push_access(owner, repo_name, github_token)
+
         new_branch = repo.create_head(branch_name)
         new_branch.checkout()
 
@@ -143,28 +231,9 @@ def pr_creation_node(state: AgentState) -> dict:
         repo.index.commit(commit_message, author=actor, committer=actor)
         logger.info(f"Committed changes to branch: {branch_name}")
 
-        github_token = state.get("github_token") or os.getenv("GITHUB_TOKEN")
-        if not github_token:
-            raise RuntimeError(
-                "No GitHub access token found for this session. Sign out and sign in with GitHub again."
-            )
-
-        origin = repo.remotes.origin
-        original_url = origin.url
-        owner, repo_name = _parse_github_owner_repo(original_url)
-        auth_url = f"https://x-access-token:{github_token}@github.com/{owner}/{repo_name}.git"
-
         try:
-            origin.set_url(auth_url)
-            push_info = origin.push(refspec=f"{branch_name}:{branch_name}")
-            for info in push_info:
-                if info.flags & info.ERROR:
-                    raise RuntimeError(
-                        f"Git push to {owner}/{repo_name} failed ({info.summary.strip()}). "
-                        "Ensure your GitHub account has write access and 'repo' OAuth scope."
-                    )
+            _git_push_with_extraheader(repo_path, branch_name, owner, repo_name, github_token)
         finally:
-            origin.set_url(original_url)
             repo.heads[base_branch].checkout()
 
         logger.info(f"Pushed branch {branch_name} to {owner}/{repo_name}")
