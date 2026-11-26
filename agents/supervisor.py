@@ -27,17 +27,19 @@ def _is_test_file(path: str) -> bool:
 
 
 def route_after_coding(state: AgentState) -> str:
-    """Routes to testing only when valid file modifications exist on disk."""
+    """Routes to testing only when new edits passed static validation."""
     modified_files = state.get("modified_files", [])
     retry_count = state.get("retry_count", 0)
+    status = state.get("status", "")
 
-    if modified_files:
-        return "testing"
-    if retry_count >= MAX_RETRIES:
-        logger.warning(f"Coding produced no modifications after {MAX_RETRIES} retries. Ending run.")
-        return END
-    logger.info(f"Coding produced no modifications (Retry {retry_count}). Routing to reflection.")
-    return "reflection"
+    if status == "coding_failed" or not modified_files:
+        if retry_count >= MAX_RETRIES:
+            logger.warning(f"Coding failed validation after {MAX_RETRIES} retries. Ending run.")
+            return END
+        logger.info(f"Coding validation failed (Retry {retry_count}). Routing directly to reflection.")
+        return "reflection"
+
+    return "testing"
 
 
 def route_after_testing(state: AgentState) -> str:

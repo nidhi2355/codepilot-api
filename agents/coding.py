@@ -24,10 +24,10 @@ IGNORED_DIRS = {
     ".ruff_cache",
 }
 
-MAX_SOURCE_FILES_CHARS = 8500
+MAX_SOURCE_FILES_CHARS = 9500
 MAX_TEST_FILES_CHARS = 4500
 MAX_SNIPPETS_CHARS = 2000
-MAX_ERRORS_CHARS = 1500
+MAX_ERRORS_CHARS = 1800
 
 
 class SearchReplaceBlock(BaseModel):
@@ -115,16 +115,29 @@ def _get_existing_dirty_sources(repo_path: str) -> list[str]:
     ]
 
 
+def _extract_stem_tokens(text: str) -> Set[str]:
+    """Extracts lowercase module stem candidates from CamelCase class names and identifiers."""
+    tokens: Set[str] = set()
+    # Split CamelCase words (e.g., ProductCatalog -> product, catalog)
+    for word in re.findall(r"\b[A-Za-z][A-Za-z0-9_]+\b", text):
+        parts = re.sub(r"([a-z0-9])([A-Z])", r"\1_\2", word).lower().split("_")
+        for p in parts:
+            if len(p) >= 4 and p not in {"test", "tests", "self", "none", "true", "false", "init", "error"}:
+                tokens.add(p)
+    return tokens
+
+
 def _collect_prioritized_files(
     repo_path: str,
     repo_files: List[str],
     retrieved_chunks: list,
     plan: List[str],
     task: str,
+    errors: List[str],
 ) -> dict[str, str]:
     """
-    Loads full contents of directly relevant source files, package __init__.py files,
-    and matching test files within separate character budgets.
+    Loads full contents of directly relevant source files, locally imported modules,
+    package __init__.py files, and matching test files within separate character budgets.
     """
     ordered_candidates: List[str] = []
     seen: Set[str] = set()
@@ -134,21 +147,62 @@ def _collect_prioritized_files(
             seen.add(rel_path)
             ordered_candidates.append(rel_path)
 
-    plan_and_task = task + "\n" + "\n".join(plan)
-    mentioned_py = set(re.findall(r"[\w./-]+\.py", plan_and_task))
+    combined_text = task + "\n" + "\n".join(plan) + "\n" + "\n".join(errors[-3:])
+
+    # 1. Explicit *.py filenames mentioned in task, plan, or recent errors
+    mentioned_py = set(re.findall(r"[\w./-]+\.py", combined_text))
     for rel_path in repo_files:
         if rel_path in mentioned_py or os.path.basename(rel_path) in mentioned_py:
             _add(rel_path)
 
-    for chunk in retrieved_chunks[:4]:
+    # 2. Match CamelCase class names / stem tokens to non-test module files (e.g. ProductCatalog -> catalog.py)
+    stem_tokens = _extract_stem_tokens(combined_text)
+    for rel_path in repo_files:
+        if _is_test_file(rel_path):
+            continue
+        base = os.path.basename(rel_path)
+        if base.endswith(".py") and base != "__init__.py":
+            stem = base[:-3].lower()
+            if stem in stem_tokens:
+                _add(rel_path)
+
+    # 3. Top retrieved chunks from vector search
+    for chunk in retrieved_chunks[:6]:
         fp = chunk.get("file_path", "").replace("\\", "/").lstrip("./")
         _add(fp)
 
+    # 4. Read initial files to discover local package imports (e.g. `from shopcore.catalog import ProductCatalog`)
+    initial_contents: dict[str, str] = {}
+    for rel_path in list(ordered_candidates):
+        full_path = os.path.join(repo_path, rel_path)
+        if os.path.isfile(full_path):
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    initial_contents[rel_path] = f.read()
+            except Exception:
+                pass
+
+    imported_stems: Set[str] = set()
+    for content in initial_contents.values():
+        for mod_path in re.findall(r"^\s*(?:from|import)\s+([\w.]+)", content, re.MULTILINE):
+            for part in mod_path.split("."):
+                if len(part) >= 3:
+                    imported_stems.add(part.lower())
+
+    for rel_path in repo_files:
+        if _is_test_file(rel_path):
+            continue
+        base = os.path.basename(rel_path)
+        if base.endswith(".py") and base[:-3].lower() in imported_stems:
+            _add(rel_path)
+
+    # 5. Include sibling __init__.py for any package module loaded
     for path in list(ordered_candidates):
         pkg_dir = os.path.dirname(path)
         if pkg_dir and not _is_test_file(path):
             _add(f"{pkg_dir}/__init__.py")
 
+    # 6. Auto-discover matching existing test files
     stems: List[str] = []
     for path in list(ordered_candidates):
         base = os.path.basename(path)
@@ -166,15 +220,17 @@ def _collect_prioritized_files(
     test_chars = 0
 
     for rel_path in ordered_candidates:
-        full_path = os.path.join(repo_path, rel_path)
-        if not os.path.isfile(full_path):
-            continue
-        try:
-            with open(full_path, "r", encoding="utf-8") as f:
-                content = f.read()
-        except Exception as e:
-            logger.warning(f"Failed to read full file {rel_path}: {e}")
-            continue
+        content = initial_contents.get(rel_path)
+        if content is None:
+            full_path = os.path.join(repo_path, rel_path)
+            if not os.path.isfile(full_path):
+                continue
+            try:
+                with open(full_path, "r", encoding="utf-8") as f:
+                    content = f.read()
+            except Exception as e:
+                logger.warning(f"Failed to read full file {rel_path}: {e}")
+                continue
 
         if _is_test_file(rel_path):
             if test_chars + len(content) > MAX_TEST_FILES_CHARS and any(
@@ -315,9 +371,14 @@ def _apply_search_replace(
             trailing_nl = "\n" if content.endswith("\n") else ""
             content = "\n".join(updated_lines) + trailing_nl
         else:
+            snippet_hint = (
+                f"\nActual '{rel_path}' contents:\n{content[:1500]}"
+                if len(content) <= 2500
+                else ""
+            )
             errors.append(
                 f"Edit #{idx} 'target_code' did not match '{rel_path}'. "
-                "Copy the exact lines character-for-character from Complete Target Files From Disk."
+                f"Copy exact lines character-for-character from Complete Target Files From Disk.{snippet_hint}"
             )
 
     return content, errors
@@ -329,9 +390,6 @@ def _generate_followup_tests(
     updated_sources: dict[str, str],
     existing_tests: dict[str, str],
 ) -> dict[str, str]:
-    """
-    Focused follow-up pass when source edits are valid on disk but unit tests were omitted.
-    """
     test_prompt = ChatPromptTemplate.from_messages([
         (
             "system",
@@ -408,8 +466,9 @@ def coding_node(state: AgentState) -> dict:
     file_tree_str = "\n".join(repo_files) if repo_files else "(no files found)"
 
     retrieved_chunks = state.get("retrieved_context", [])
+    raw_errors = state.get("errors", [])
     full_files_map = _collect_prioritized_files(
-        repo_path, repo_files, retrieved_chunks, state.get("plan", []), state["task"]
+        repo_path, repo_files, retrieved_chunks, state.get("plan", []), state["task"], raw_errors
     )
     discovered_test_files = sorted(p for p in full_files_map if _is_test_file(p))
     test_targets_hint = (
@@ -431,7 +490,7 @@ def coding_node(state: AgentState) -> dict:
                 "copy the last 3–5 lines of that file as `target_code` and include them followed by your new code in "
                 "`replacement_code` (for test files, leaving `target_code` empty appends tests cleanly).\n"
                 "3. PLACE LOGIC IN THE RIGHT MODULE: Put module-level constants/functions in the target module "
-                "(e.g. `src/shopcore/pricing.py`) rather than inlining them into caller functions.\n"
+                "(e.g. `src/shopcore/catalog.py`, `src/shopcore/pricing.py`) rather than inlining them.\n"
                 "4. SOURCE + TESTS TOGETHER: Always modify BOTH the target implementation file(s) AND the matching "
                 f"test file ({test_targets_hint}) in the same response.\n\n"
                 "{format_instructions}"
@@ -463,7 +522,7 @@ def coding_node(state: AgentState) -> dict:
         snippets_len += len(entry)
     snippets_str = "\n\n".join(snippets_parts) or "(none)"
 
-    recent_errors = "\n".join(state.get("errors", [])[-2:])
+    recent_errors = "\n".join(raw_errors[-2:])
     if len(recent_errors) > MAX_ERRORS_CHARS:
         recent_errors = recent_errors[-MAX_ERRORS_CHARS:]
 
@@ -488,6 +547,7 @@ def coding_node(state: AgentState) -> dict:
         if not candidate.modifications:
             return {
                 "modified_files": already_dirty_sources,
+                "status": "coding_failed",
                 "errors": ["Coding Error: Returned empty modifications list; provide required file edits."],
             }
 
@@ -502,7 +562,6 @@ def coding_node(state: AgentState) -> dict:
         for norm_path, edits in grouped_edits.items():
             full_path = os.path.join(repo_path, norm_path)
             if os.path.exists(full_path):
-                # Read clean HEAD version for tracked files so patches apply against a known baseline
                 base_content = full_files_map.get(norm_path)
                 if base_content is None:
                     with open(full_path, "r", encoding="utf-8") as f:
@@ -541,7 +600,6 @@ def coding_node(state: AgentState) -> dict:
                 "Missing source code changes: include edits to the target implementation file(s) alongside tests."
             )
 
-        # If source edits are valid and ONLY tests were omitted, write source edits and run a focused test pass
         if not static_errors and not has_test and candidate_contents:
             written_files = list(already_dirty_sources)
             for norm_path, content in candidate_contents.items():
@@ -556,7 +614,6 @@ def coding_node(state: AgentState) -> dict:
                 p: full_files_map[p] for p in discovered_test_files if p in full_files_map
             }
             if not existing_tests_map:
-                # Fallback target test path derived from primary edited source module
                 primary_src = next((p for p in candidate_contents if not _is_test_file(p)), "module.py")
                 stem = os.path.basename(primary_src)[:-3]
                 existing_tests_map[f"tests/test_{stem}.py"] = ""
@@ -572,12 +629,13 @@ def coding_node(state: AgentState) -> dict:
                     if tp not in written_files:
                         written_files.append(tp)
                 if written_tests:
-                    return {"modified_files": written_files}
+                    return {"modified_files": written_files, "status": "coded"}
             except Exception as test_gen_err:
                 logger.warning(f"Focused follow-up test generation failed: {test_gen_err}")
 
             return {
                 "modified_files": written_files,
+                "status": "coding_failed",
                 "errors": [
                     f"Coding Error:\nMissing unit tests: add or update tests in {test_targets_hint}."
                 ],
@@ -593,10 +651,10 @@ def coding_node(state: AgentState) -> dict:
             logger.warning(f"Coding validation failed:\n{combined_msg}")
             return {
                 "modified_files": already_dirty_sources,
+                "status": "coding_failed",
                 "errors": [f"Coding Error:\n{combined_msg}"],
             }
 
-        # Reset only files being freshly overwritten so prior verified source edits remain intact
         if os.path.exists(os.path.join(repo_path, ".git")):
             for norm_path in candidate_contents:
                 if os.path.exists(os.path.join(repo_path, norm_path)):
@@ -616,8 +674,12 @@ def coding_node(state: AgentState) -> dict:
                 modified_files.append(norm_path)
             logger.info(f"Successfully wrote verified edits to: {full_path}")
 
-        return {"modified_files": modified_files}
+        return {"modified_files": modified_files, "status": "coded"}
 
     except Exception as e:
         logger.error(f"Coding failed: {str(e)}")
-        return {"modified_files": already_dirty_sources, "errors": [f"Coding Error: {str(e)}"]}
+        return {
+            "modified_files": already_dirty_sources,
+            "status": "coding_failed",
+            "errors": [f"Coding Error: {str(e)}"],
+        }

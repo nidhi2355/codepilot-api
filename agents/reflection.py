@@ -48,10 +48,11 @@ def reflection_node(state: AgentState) -> dict:
     modified_files = state.get("modified_files", [])
     next_retry = retry_count + 1
 
-    if not modified_files:
+    if not modified_files or state.get("status") == "coding_failed":
         latest_err = (state.get("errors") or ["Coding produced no valid file modifications."])[-1]
         return {
             "retry_count": next_retry,
+            "status": "retrying",
             "errors": [_summarize_coding_guidance(next_retry, latest_err)],
         }
 
